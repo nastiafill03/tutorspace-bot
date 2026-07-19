@@ -4,12 +4,16 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import TypeVar
 from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -35,10 +39,15 @@ BTN_TOP      = "🏆 Топ реферери"
 BTN_RECENT   = "🆕 Останні реєстрації"
 
 STATUS_CALLBACK = "show_status"
+ACTIVATE_PROMO_CALLBACK = "activate_promo"
 
 # ── Init ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+
+class PromoStates(StatesGroup):
+    waiting_for_code = State()
 
 
 def required_env(name: str) -> str:
@@ -58,7 +67,7 @@ except ValueError as exc:
 INSTAGRAM_URL        = os.environ.get("INSTAGRAM_URL", "").strip()
 
 bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher()
+dp  = Dispatcher(storage=MemoryStorage())
 db: Client = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY,
@@ -89,6 +98,7 @@ def founder_keyboard(ref_link: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📨 Поділитися з другом", url=share_url)],
         [InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)],
+        [InlineKeyboardButton(text="🎁 Активувати промокод", callback_data=ACTIVATE_PROMO_CALLBACK)],
     ]
     if INSTAGRAM_URL:
         rows.append([InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)])
@@ -96,10 +106,21 @@ def founder_keyboard(ref_link: str) -> InlineKeyboardMarkup:
 
 
 def waitlist_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)]]
+    rows = [
+        [InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)],
+        [InlineKeyboardButton(text="🎁 Активувати промокод", callback_data=ACTIVATE_PROMO_CALLBACK)],
+    ]
     if INSTAGRAM_URL:
         rows.append([InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def promo_prompt_keyboard() -> InlineKeyboardMarkup | None:
+    if not INSTAGRAM_URL:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)],
+    ])
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
@@ -232,6 +253,65 @@ def status_view(user_data: dict, ref_link: str) -> tuple[str, InlineKeyboardMark
 
     text = "✋ Ти в списку очікування.\nПовідомимо при запуску."
     return text, waitlist_keyboard()
+
+
+# ── Промокоди: DB helpers ──────────────────────────────────────────────────────
+
+def get_promo_code(code: str) -> dict | None:
+    normalized = code.strip().upper()
+    res = db.table("promo_codes").select("*").eq("code", normalized).execute()
+    return res.data[0] if res.data else None
+
+
+def get_activation(telegram_id: int, code: str) -> dict | None:
+    normalized = code.strip().upper()
+    res = (
+        db.table("promo_activations")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .eq("code", normalized)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def record_activation(telegram_id: int, code: str, bonus_months: int) -> dict:
+    normalized = code.strip().upper()
+    row = {
+        "telegram_id": telegram_id,
+        "code": normalized,
+        "bonus_months": bonus_months,
+    }
+    res = db.table("promo_activations").insert(row).execute()
+
+    promo = get_promo_code(normalized)
+    if promo and promo.get("is_single_use"):
+        db.table("promo_codes").update({
+            "used_by": telegram_id,
+            "used_at": datetime.now(timezone.utc).isoformat(),
+            "is_active": False,
+        }).eq("code", normalized).execute()
+    elif promo:
+        db.table("promo_codes").update({
+            "activations_count": promo["activations_count"] + 1,
+        }).eq("code", normalized).execute()
+
+    return res.data[0] if res.data else {}
+
+
+def promo_activations_total() -> int:
+    res = db.table("promo_activations").select("id", count="exact").execute()
+    return res.count or 0
+
+
+def active_promo_codes() -> list[dict]:
+    res = (
+        db.table("promo_codes")
+        .select("code, activations_count, max_activations, is_single_use")
+        .eq("is_active", True)
+        .execute()
+    )
+    return res.data or []
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -418,6 +498,78 @@ async def cb_status(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# ── Промокоди: кнопка, /promo, введення коду ──────────────────────────────────
+
+PROMO_PROMPT_TEXT = (
+    "🎁 Введи кодове слово. Знайдеш його в Instagram після підписки — "
+    "ми надішлемо його в директ."
+)
+
+
+@dp.callback_query(F.data == ACTIVATE_PROMO_CALLBACK)
+async def cb_activate_promo(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PromoStates.waiting_for_code)
+    if callback.message:
+        await callback.message.answer(PROMO_PROMPT_TEXT, reply_markup=promo_prompt_keyboard())
+    await callback.answer()
+
+
+@dp.message(Command("promo"))
+async def cmd_promo(message: Message, state: FSMContext) -> None:
+    await state.set_state(PromoStates.waiting_for_code)
+    await message.answer(PROMO_PROMPT_TEXT, reply_markup=promo_prompt_keyboard())
+
+
+async def validate_and_activate_promo(telegram_id: int, raw_code: str) -> tuple[bool, str]:
+    """Чиста бізнес-логіка активації промокоду, відокремлена від aiogram-хендлера.
+
+    process_promo_code (нижче) — тонка обгортка над Message/FSMContext, яку
+    незручно тестувати напряму (довелось би підробляти купу полів aiogram.Message
+    заради перевірки чистої логіки перевірок). Уся послідовність перевірок —
+    існування коду, повторна активація, ліміти — і сам запис активації винесені
+    сюди у вигляді функції з простими аргументами (telegram_id: int, код: str) і
+    простим результатом (успіх/текст відповіді), яку викликає і хендлер, і тести
+    напряму, без жодних фейкових Telegram-об'єктів.
+    """
+    code = raw_code.strip().upper()
+
+    promo = await db_call(get_promo_code, code)
+    if not promo or not promo.get("is_active"):
+        return False, "❌ Такого промокоду не існує або він більше не діє."
+
+    existing_activation = await db_call(get_activation, telegram_id, code)
+    if existing_activation:
+        return False, "ℹ️ Ти вже активував цей промокод раніше."
+
+    if promo.get("is_single_use"):
+        if promo.get("used_by") is not None:
+            return False, "❌ Цей код вже використано."
+    else:
+        max_activations = promo.get("max_activations")
+        if max_activations is not None and promo["activations_count"] >= max_activations:
+            return False, "❌ Ліміт активацій цього промокоду вичерпано."
+
+    bonus_months = promo["bonus_months"]
+    await db_call(record_activation, telegram_id, code, bonus_months)
+
+    return True, (
+        f"🎉 Промокод активовано! Тобі нараховано {bonus_months} місяці Pro. "
+        f"Бонус застосується автоматично, коли ти зареєструєшся на платформі після запуску."
+    )
+
+
+@dp.message(PromoStates.waiting_for_code, F.text, ~F.text.startswith("/"))
+async def process_promo_code(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    log.info("Promo code attempt from user_id=%s code=%r", user.id, message.text)
+
+    async with registration_lock:
+        _success, text = await validate_and_activate_promo(user.id, message.text or "")
+
+    await state.clear()
+    await message.answer(text)
+
+
 # ── Адмін: /admin, /stats, /top, /recent + reply-кнопки ──────────────────────
 
 def is_admin(message: Message) -> bool:
@@ -458,15 +610,40 @@ async def cmd_stats(message: Message) -> None:
         await reject_non_admin(message)
         return
 
-    total    = await db_call(total_users)
-    founders = await db_call(founder_count)
-    waiting  = total - founders
+    total      = await db_call(total_users)
+    founders   = await db_call(founder_count)
+    waiting    = total - founders
+    promo_used = await db_call(promo_activations_total)
     await message.answer(
         f"📋 Статистика TutorSpace:\n\n"
         f"Усього: {total}\n"
         f"Founding Members: {founders}/{FOUNDING_LIMIT}\n"
-        f"У списку очікування: {waiting}"
+        f"У списку очікування: {waiting}\n"
+        f"Активацій промокодів: {promo_used}"
     )
+
+
+@dp.message(Command("promostats"))
+async def cmd_promostats(message: Message) -> None:
+    log.info(
+        "Incoming /promostats from user_id=%s username=%s",
+        message.from_user.id if message.from_user else None,
+        message.from_user.username if message.from_user else None,
+    )
+    if not is_admin(message):
+        await reject_non_admin(message)
+        return
+
+    codes = await db_call(active_promo_codes)
+    if not codes:
+        await message.answer("Активних промокодів немає 🙁")
+        return
+
+    lines = []
+    for c in codes:
+        limit = "1" if c.get("is_single_use") else (c.get("max_activations") or "∞")
+        lines.append(f"• {c['code']} — {c['activations_count']}/{limit}")
+    await message.answer("🎁 Активні промокоди:\n\n" + "\n".join(lines))
 
 
 @dp.message(Command("top"))
@@ -566,13 +743,15 @@ async def error_handler(event) -> bool:
 async def main() -> None:
     try:
         await bot.set_my_commands([
-            BotCommand(command="start",  description="Почати / головне меню"),
-            BotCommand(command="id",     description="Показати мій Telegram ID"),
-            BotCommand(command="status", description="Мій статус"),
-            BotCommand(command="admin",  description="Адмін-меню"),
-            BotCommand(command="stats",  description="Статистика для адміна"),
-            BotCommand(command="top",    description="Топ реферерів"),
-            BotCommand(command="recent", description="Останні реєстрації"),
+            BotCommand(command="start",      description="Почати / головне меню"),
+            BotCommand(command="id",         description="Показати мій Telegram ID"),
+            BotCommand(command="status",     description="Мій статус"),
+            BotCommand(command="promo",      description="Активувати промокод"),
+            BotCommand(command="admin",      description="Адмін-меню"),
+            BotCommand(command="stats",      description="Статистика для адміна"),
+            BotCommand(command="top",        description="Топ реферерів"),
+            BotCommand(command="recent",     description="Останні реєстрації"),
+            BotCommand(command="promostats", description="Статистика промокодів (адмін)"),
         ])
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Starting TutorSpaceBot (polling)...")
