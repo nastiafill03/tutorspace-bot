@@ -4,22 +4,21 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import TypeVar
 from urllib.parse import quote
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import CommandStart, Command, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand,
+    BotCommandScopeDefault, BotCommandScopeChat,
 )
 from dotenv import load_dotenv
 from supabase import create_client, Client, ClientOptions
@@ -33,21 +32,23 @@ BASE_MONTHS     = 2
 REFERRAL_MONTHS = 1
 MAX_REFERRALS   = 10
 FOUNDING_LIMIT  = 30
+BROADCAST_RATE  = 25  # messages / second (Telegram rate limit)
 
 BTN_WAITLIST = "👥 Waitlist"
 BTN_TOP      = "🏆 Топ реферери"
 BTN_RECENT   = "🆕 Останні реєстрації"
+BTN_LAUNCH   = "🚀 Запустити платформу"
 
-STATUS_CALLBACK = "show_status"
-ACTIVATE_PROMO_CALLBACK = "activate_promo"
+STATUS_CALLBACK        = "show_status"
+CONFIRM_LAUNCH_CALLBACK = "confirm_launch"
+CANCEL_LAUNCH_CALLBACK  = "cancel_launch"
+# Lesson action callbacks carry the request id: "lesson_confirm:<id>" / "lesson_reject:<id>"
+LESSON_CONFIRM_PREFIX = "lesson_confirm:"
+LESSON_REJECT_PREFIX  = "lesson_reject:"
 
 # ── Init ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-
-
-class PromoStates(StatesGroup):
-    waiting_for_code = State()
 
 
 def required_env(name: str) -> str:
@@ -64,16 +65,18 @@ try:
     ADMIN_ID         = int(required_env("ADMIN_ID"))
 except ValueError as exc:
     raise RuntimeError("ADMIN_ID must be a numeric Telegram user id") from exc
-INSTAGRAM_URL        = os.environ.get("INSTAGRAM_URL", "").strip()
+PLATFORM_URL    = required_env("PLATFORM_URL")
+INSTAGRAM_URL   = os.environ.get("INSTAGRAM_URL", "").strip()
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "").strip()
+NOTIFY_PORT     = int(os.environ.get("NOTIFY_PORT", "8080"))
 
 bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
+dp  = Dispatcher()
 db: Client = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY,
     options=ClientOptions(postgrest_client_timeout=12, storage_client_timeout=12),
 )
-registration_lock = asyncio.Lock()
 bot_username_cache: str | None = None
 
 
@@ -92,13 +95,11 @@ async def db_call(func: Callable[..., T], *args, **kwargs) -> T:
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def founder_keyboard(ref_link: str) -> InlineKeyboardMarkup:
-    invite_text = "Приєднуйся до раннього доступу TutorSpace — платформи для репетиторів 🎓"
+    invite_text = "Приєднуйся до TutorSpace — платформи для репетиторів 🎓"
     share_url = f"https://t.me/share/url?url={quote(ref_link, safe='')}&text={quote(invite_text)}"
-
     rows = [
         [InlineKeyboardButton(text="📨 Поділитися з другом", url=share_url)],
         [InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)],
-        [InlineKeyboardButton(text="🎁 Активувати промокод", callback_data=ACTIVATE_PROMO_CALLBACK)],
     ]
     if INSTAGRAM_URL:
         rows.append([InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)])
@@ -106,21 +107,10 @@ def founder_keyboard(ref_link: str) -> InlineKeyboardMarkup:
 
 
 def waitlist_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)],
-        [InlineKeyboardButton(text="🎁 Активувати промокод", callback_data=ACTIVATE_PROMO_CALLBACK)],
-    ]
+    rows = [[InlineKeyboardButton(text="📊 Мій статус", callback_data=STATUS_CALLBACK)]]
     if INSTAGRAM_URL:
         rows.append([InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def promo_prompt_keyboard() -> InlineKeyboardMarkup | None:
-    if not INSTAGRAM_URL:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Наш Instagram", url=INSTAGRAM_URL)],
-    ])
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
@@ -129,53 +119,21 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             KeyboardButton(text=BTN_WAITLIST),
             KeyboardButton(text=BTN_TOP),
             KeyboardButton(text=BTN_RECENT),
+            KeyboardButton(text=BTN_LAUNCH),
         ]],
         resize_keyboard=True,
         persistent=True,
     )
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── DB helpers — waitlist ─────────────────────────────────────────────────────
 
 def get_user(telegram_id: int) -> dict | None:
     res = db.table("waitlist_users").select("*").eq("telegram_id", telegram_id).execute()
     return res.data[0] if res.data else None
 
 
-def create_user(telegram_id: int, username: str | None, first_name: str | None,
-                referred_by: int | None, is_founder: bool, founder_number: int | None,
-                months_earned: int) -> dict:
-    row = {
-        "telegram_id": telegram_id,
-        "username": username,
-        "first_name": first_name,
-        "referred_by": referred_by,
-        "referral_count": 0,
-        "months_earned": months_earned,
-        "is_founder": is_founder,
-        "founder_number": founder_number,
-    }
-    res = db.table("waitlist_users").insert(row).execute()
-    return res.data[0]
-
-
-def increment_referrer(referrer_id: int) -> dict:
-    ref = get_user(referrer_id)
-    if not ref:
-        return {}
-    new_count  = ref["referral_count"] + 1
-    new_months = ref["months_earned"] + REFERRAL_MONTHS
-    res = (
-        db.table("waitlist_users")
-        .update({"referral_count": new_count, "months_earned": new_months})
-        .eq("telegram_id", referrer_id)
-        .execute()
-    )
-    return res.data[0] if res.data else {}
-
-
 def founder_count() -> int:
-    # ADMIN_ID is excluded everywhere here — the admin manages the waitlist, doesn't join it.
     res = (
         db.table("waitlist_users")
         .select("telegram_id", count="exact")
@@ -221,16 +179,89 @@ def recent_users(limit: int = 5) -> list[dict]:
     return res.data or []
 
 
-def parse_ref_id(arg: str, user_id: int) -> int | None:
-    """Parses 'ref_<id>' deep-link param. Returns None on absence, bad format, or self-referral."""
-    if not arg.startswith("ref_"):
-        return None
-    try:
-        ref_id = int(arg[4:])
-    except ValueError:
-        return None
-    return ref_id if ref_id != user_id else None
+# ── DB helpers — broadcast ────────────────────────────────────────────────────
 
+def pending_broadcast_count() -> int:
+    res = (
+        db.table("waitlist_users")
+        .select("telegram_id", count="exact")
+        .is_("notified_at", "null")
+        .neq("telegram_id", ADMIN_ID)
+        .execute()
+    )
+    return res.count or 0
+
+
+def pending_broadcast_users() -> list[dict]:
+    res = (
+        db.table("waitlist_users")
+        .select("telegram_id, months_earned, signup_token")
+        .is_("notified_at", "null")
+        .neq("telegram_id", ADMIN_ID)
+        .execute()
+    )
+    return res.data or []
+
+
+def mark_notified(telegram_id: int, granted: int) -> None:
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=30)
+    db.table("waitlist_users").update({
+        "notified_at": now.isoformat(),
+        "token_expires_at": expires.isoformat(),
+        "granted_months": granted,
+    }).eq("telegram_id", telegram_id).execute()
+
+
+# ── DB helpers — promo (kept for granted_months calculation in broadcast) ─────
+
+def get_promo_code(code: str) -> dict | None:
+    normalized = code.strip().upper()
+    res = db.table("promo_codes").select("*").eq("code", normalized).execute()
+    return res.data[0] if res.data else None
+
+
+def get_promo_months(telegram_id: int) -> int:
+    res = (
+        db.table("promo_activations")
+        .select("bonus_months")
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return sum(row["bonus_months"] for row in (res.data or []))
+
+
+# ── DB helpers — platform integration ────────────────────────────────────────
+
+def _rpc_link_telegram(code: str, chat_id: int):
+    # RPC name and params must match the function created in the Next.js / Supabase migration.
+    return db.rpc("link_telegram", {
+        "p_one_time_code": code,
+        "p_chat_id": str(chat_id),
+    }).execute()
+
+
+def _get_profile_chat_id(profile_id: str) -> int | None:
+    res = (
+        db.table("profiles")
+        .select("telegram_chat_id")
+        .eq("id", profile_id)
+        .execute()
+    )
+    if res.data and res.data[0].get("telegram_chat_id"):
+        return int(res.data[0]["telegram_chat_id"])
+    return None
+
+
+def _rpc_confirm_lesson(reschedule_id: str):
+    return db.rpc("confirm_lesson_reschedule", {"p_reschedule_id": reschedule_id}).execute()
+
+
+def _rpc_reject_lesson(reschedule_id: str):
+    return db.rpc("reject_lesson_reschedule", {"p_reschedule_id": reschedule_id}).execute()
+
+
+# ── Misc helpers ──────────────────────────────────────────────────────────────
 
 async def ref_link_for(user_id: int) -> str:
     global bot_username_cache
@@ -241,7 +272,6 @@ async def ref_link_for(user_id: int) -> str:
 
 
 def status_view(user_data: dict, ref_link: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Builds the (text, keyboard) pair shared by /status and the inline status button."""
     if user_data["is_founder"]:
         text = (
             f"📊 Твій статус:\n\n"
@@ -255,63 +285,12 @@ def status_view(user_data: dict, ref_link: str) -> tuple[str, InlineKeyboardMark
     return text, waitlist_keyboard()
 
 
-# ── Промокоди: DB helpers ──────────────────────────────────────────────────────
-
-def get_promo_code(code: str) -> dict | None:
-    normalized = code.strip().upper()
-    res = db.table("promo_codes").select("*").eq("code", normalized).execute()
-    return res.data[0] if res.data else None
+def is_admin(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id == ADMIN_ID)
 
 
-def get_activation(telegram_id: int, code: str) -> dict | None:
-    normalized = code.strip().upper()
-    res = (
-        db.table("promo_activations")
-        .select("*")
-        .eq("telegram_id", telegram_id)
-        .eq("code", normalized)
-        .execute()
-    )
-    return res.data[0] if res.data else None
-
-
-def record_activation(telegram_id: int, code: str, bonus_months: int) -> dict:
-    normalized = code.strip().upper()
-    row = {
-        "telegram_id": telegram_id,
-        "code": normalized,
-        "bonus_months": bonus_months,
-    }
-    res = db.table("promo_activations").insert(row).execute()
-
-    promo = get_promo_code(normalized)
-    if promo and promo.get("is_single_use"):
-        db.table("promo_codes").update({
-            "used_by": telegram_id,
-            "used_at": datetime.now(timezone.utc).isoformat(),
-            "is_active": False,
-        }).eq("code", normalized).execute()
-    elif promo:
-        db.table("promo_codes").update({
-            "activations_count": promo["activations_count"] + 1,
-        }).eq("code", normalized).execute()
-
-    return res.data[0] if res.data else {}
-
-
-def promo_activations_total() -> int:
-    res = db.table("promo_activations").select("id", count="exact").execute()
-    return res.count or 0
-
-
-def active_promo_codes() -> list[dict]:
-    res = (
-        db.table("promo_codes")
-        .select("code, activations_count, max_activations, is_single_use")
-        .eq("is_active", True)
-        .execute()
-    )
-    return res.data or []
+async def reject_non_admin(message: Message) -> None:
+    await message.answer("Невідома команда.")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -319,160 +298,44 @@ def active_promo_codes() -> list[dict]:
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     user = message.from_user
-    log.info("Incoming /start from user_id=%s username=%s args=%r", user.id, user.username, command.args)
+    log.info("Incoming /start from user_id=%s username=%s", user.id, user.username)
 
     if user.id == ADMIN_ID:
-        # Admin manages the waitlist — never registered as a participant or founder slot.
         await message.answer(
             "👋 Привіт, адміне! Ти керуєш ботом і не рахуєшся учасником waitlist.\n"
-            f"Твій ID: {user.id}\n\n"
-            "Команди: /admin, /stats, /top, /recent",
+            f"Твій ID: {user.id}\n\nКоманди: /admin, /stats, /top, /recent",
             reply_markup=admin_keyboard(),
         )
         return
 
-    async with registration_lock:
-        existing = await db_call(get_user, user.id)
-
-        if not existing:
-            ref_id = parse_ref_id((command.args or "").strip(), user.id)
-            referrer = await db_call(get_user, ref_id) if ref_id else None
-            referrer_eligible = (
-                referrer is not None
-                and referrer["is_founder"]
-                and referrer["referral_count"] < MAX_REFERRALS
-            )
-
-            current_founders = await db_call(founder_count)
-            becomes_founder = current_founders < FOUNDING_LIMIT
-
-            if becomes_founder:
-                founder_number = current_founders + 1
-                referred_by = ref_id if referrer_eligible else None
-                months_earned = BASE_MONTHS
-
-                await db_call(
-                    create_user,
-                    telegram_id=user.id,
-                    username=user.username,
-                    first_name=user.first_name,
-                    referred_by=referred_by,
-                    is_founder=True,
-                    founder_number=founder_number,
-                    months_earned=months_earned,
-                )
-                updated_referrer = (
-                    await db_call(increment_referrer, referred_by) if referred_by else None
-                )
-            else:
-                founder_number = None
-                referred_by = None
-                months_earned = 0
-                updated_referrer = None
-                await db_call(
-                    create_user,
-                    telegram_id=user.id,
-                    username=user.username,
-                    first_name=user.first_name,
-                    referred_by=None,
-                    is_founder=False,
-                    founder_number=None,
-                    months_earned=0,
-                )
-        else:
-            ref_id = None
-            referrer = None
-            becomes_founder = False
-            founder_number = None
-            referred_by = None
-            months_earned = 0
-            updated_referrer = None
-
-    if existing:
-        # Repeat /start — only show status; bonuses are credited on first entry only.
-        ref_link = await ref_link_for(user.id)
-        text, kb = status_view(existing, ref_link)
-        await message.answer(text, reply_markup=kb)
-        return
-
-    if becomes_founder:
-        if referred_by:
-            updated = updated_referrer or {}
-            try:
-                await bot.send_message(
-                    referred_by,
-                    f"🎉 Друг приєднався як Founding Member! +{REFERRAL_MONTHS} місяць.\n"
-                    f"Тепер у тебе {updated.get('months_earned', '?')} · "
-                    f"запрошено {updated.get('referral_count', '?')}/{MAX_REFERRALS}.",
-                )
-            except Exception:
-                # Referrer may have blocked the bot — never let this break onboarding.
-                log.warning("Could not notify referrer %s", referred_by)
-
-        slots_left = FOUNDING_LIMIT - founder_number
-        text = (
-            f"🎉 Вітаю в ранньому доступі TutorSpace! Ти — Founding Member #{founder_number} "
-            f"з {FOUNDING_LIMIT}. Лишилось {slots_left} місць. "
-            f"За передзапис тобі нараховано {BASE_MONTHS} місяці безкоштовно. "
-            f"Приведи колегу-репетитора, поки є місця — і ти отримаєш ще "
-            f"+{REFERRAL_MONTHS} місяць (до {MAX_REFERRALS} друзів)."
-        )
-        if referred_by:
-            text += (
-                f"\n\nТи прийшов за запрошенням друга, але стартовий бонус для нового "
-                f"Founding Member лишається {months_earned} місяці."
-            )
-
-        ref_link = await ref_link_for(user.id)
-        await message.answer(text, reply_markup=founder_keyboard(ref_link))
-
-    else:
-        if referrer is not None:
-            try:
-                await bot.send_message(
-                    ref_id,
-                    "👀 Друг хотів приєднатися, але Founding-місця вже зайнято, "
-                    "бонус не нараховано. Дякуємо, що ділишся 🙌",
-                )
-            except Exception:
-                log.warning("Could not notify referrer %s about cap", ref_id)
-
-        text = (
-            f"🙌 Founding-місця вже зайняті — усі {FOUNDING_LIMIT} розібрали! "
-            f"Але ти в списку очікування. Щойно відкриємо доступ — напишемо тобі одним із перших."
-        )
-        await message.answer(text, reply_markup=waitlist_keyboard())
+    await message.answer(
+        f"🎉 TutorSpace вже відкрита!\n\n"
+        f"Заходь і реєструйся на платформі: {PLATFORM_URL}\n\n"
+        f"Якщо ти отримав(-ла) персональне посилання — скористайся ним: там враховані "
+        f"твої бонуси. Якщо ні — реєструйся за звичайним посиланням вище."
+    )
 
 
 # ── /status + кнопка "📊 Мій статус" ──────────────────────────────────────────
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message) -> None:
-    user = message.from_user
-    if not user:
+    if not is_admin(message):
+        await reject_non_admin(message)
         return
-
-    await message.answer(
-        f"Твій Telegram ID: {user.id}\n"
-        f"ADMIN_ID у боті: {ADMIN_ID}\n"
-        f"Адмін-доступ: {'так' if user.id == ADMIN_ID else 'ні'}"
-    )
+    await message.answer(f"Твій Telegram ID: {message.from_user.id}")
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message) -> None:
-    log.info(
-        "Incoming /status from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
+    log.info("Incoming /status from user_id=%s", message.from_user.id if message.from_user else None)
     if message.from_user.id == ADMIN_ID:
         await message.answer("Ти адмін — не рахуєшся учасником. Дивись /stats 📋")
         return
 
     user_data = await db_call(get_user, message.from_user.id)
     if not user_data:
-        await message.answer("Ти ще не в списку очікування. Напиши /start, щоб приєднатись!")
+        await message.answer(f"Тебе немає у списку. Зареєструйся на платформі: {PLATFORM_URL}")
         return
 
     ref_link = await ref_link_for(message.from_user.id)
@@ -488,7 +351,7 @@ async def cb_status(callback: CallbackQuery) -> None:
 
     user_data = await db_call(get_user, callback.from_user.id)
     if not user_data:
-        await callback.answer("Спочатку напиши /start", show_alert=True)
+        await callback.answer("Спочатку зареєструйся на платформі.", show_alert=True)
         return
 
     ref_link = await ref_link_for(callback.from_user.id)
@@ -498,161 +361,182 @@ async def cb_status(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# ── Промокоди: кнопка, /promo, введення коду ──────────────────────────────────
+# ── /link — прив'язати Telegram до профілю TutorSpace ────────────────────────
 
-PROMO_PROMPT_TEXT = (
-    "🎁 Введи кодове слово. Знайдеш його в Instagram після підписки — "
-    "ми надішлемо його в директ."
-)
+@dp.message(Command("link"))
+async def cmd_link(message: Message, command: CommandObject) -> None:
+    code = (command.args or "").strip()
+    if not code:
+        await message.answer(
+            "Вкажи одноразовий код з профілю: /link <код>\n\n"
+            "Знайдеш його в профілі на сайті TutorSpace у розділі «Налаштування»."
+        )
+        return
+
+    chat_id = message.chat.id
+    try:
+        result = await db_call(_rpc_link_telegram, code, chat_id)
+        if result.data:
+            await message.answer(
+                "✅ Telegram успішно прив'язано до профілю TutorSpace!\n"
+                "Тепер будеш отримувати сповіщення про уроки та платежі тут."
+            )
+        else:
+            await message.answer(
+                "❌ Код невірний або вже використаний. Створи новий у профілі на сайті."
+            )
+    except Exception:
+        log.exception("RPC link_telegram failed for chat_id=%s", chat_id)
+        await message.answer("❌ Сталася помилка. Спробуй ще раз або зверніться до підтримки.")
 
 
-@dp.callback_query(F.data == ACTIVATE_PROMO_CALLBACK)
-async def cb_activate_promo(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PromoStates.waiting_for_code)
-    if callback.message:
-        await callback.message.answer(PROMO_PROMPT_TEXT, reply_markup=promo_prompt_keyboard())
-    await callback.answer()
+# ── Broadcast: кнопка "🚀 Запустити платформу" ───────────────────────────────
 
+@dp.message(F.text == BTN_LAUNCH)
+async def btn_launch(message: Message) -> None:
+    if not is_admin(message):
+        return
 
-@dp.message(Command("promo"))
-async def cmd_promo(message: Message, state: FSMContext) -> None:
-    await state.set_state(PromoStates.waiting_for_code)
-    await message.answer(PROMO_PROMPT_TEXT, reply_markup=promo_prompt_keyboard())
-
-
-async def validate_and_activate_promo(telegram_id: int, raw_code: str) -> tuple[bool, str]:
-    """Чиста бізнес-логіка активації промокоду, відокремлена від aiogram-хендлера.
-
-    process_promo_code (нижче) — тонка обгортка над Message/FSMContext, яку
-    незручно тестувати напряму (довелось би підробляти купу полів aiogram.Message
-    заради перевірки чистої логіки перевірок). Уся послідовність перевірок —
-    існування коду, повторна активація, ліміти — і сам запис активації винесені
-    сюди у вигляді функції з простими аргументами (telegram_id: int, код: str) і
-    простим результатом (успіх/текст відповіді), яку викликає і хендлер, і тести
-    напряму, без жодних фейкових Telegram-об'єктів.
-    """
-    code = raw_code.strip().upper()
-
-    promo = await db_call(get_promo_code, code)
-    if not promo or not promo.get("is_active"):
-        return False, "❌ Такого промокоду не існує або він більше не діє."
-
-    existing_activation = await db_call(get_activation, telegram_id, code)
-    if existing_activation:
-        return False, "ℹ️ Ти вже активував цей промокод раніше."
-
-    if promo.get("is_single_use"):
-        if promo.get("used_by") is not None:
-            return False, "❌ Цей код вже використано."
-    else:
-        max_activations = promo.get("max_activations")
-        if max_activations is not None and promo["activations_count"] >= max_activations:
-            return False, "❌ Ліміт активацій цього промокоду вичерпано."
-
-    bonus_months = promo["bonus_months"]
-    await db_call(record_activation, telegram_id, code, bonus_months)
-
-    return True, (
-        f"🎉 Промокод активовано! Тобі нараховано {bonus_months} місяці Pro. "
-        f"Бонус застосується автоматично, коли ти зареєструєшся на платформі після запуску."
+    count = await db_call(pending_broadcast_count)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, надіслати", callback_data=CONFIRM_LAUNCH_CALLBACK)],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=CANCEL_LAUNCH_CALLBACK)],
+    ])
+    await message.answer(
+        f"Буде надіслано персональні посилання {count} людям з вейтлісту.\n"
+        f"Це незворотна дія. Підтвердити?",
+        reply_markup=kb,
     )
 
 
-@dp.message(PromoStates.waiting_for_code, F.text, ~F.text.startswith("/"))
-async def process_promo_code(message: Message, state: FSMContext) -> None:
-    user = message.from_user
-    log.info("Promo code attempt from user_id=%s code=%r", user.id, message.text)
+@dp.callback_query(F.data == CONFIRM_LAUNCH_CALLBACK)
+async def cb_confirm_launch(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Тільки для адміна.", show_alert=True)
+        return
 
-    async with registration_lock:
-        _success, text = await validate_and_activate_promo(user.id, message.text or "")
+    if callback.message:
+        await callback.message.edit_text("🚀 Розсилка запущена, зачекай...")
+    await callback.answer()
+    asyncio.create_task(run_broadcast(callback.from_user.id))
 
-    await state.clear()
-    await message.answer(text)
+
+@dp.callback_query(F.data == CANCEL_LAUNCH_CALLBACK)
+async def cb_cancel_launch(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Тільки для адміна.", show_alert=True)
+        return
+
+    if callback.message:
+        await callback.message.edit_text("Скасовано.")
+    await callback.answer()
+
+
+async def run_broadcast(admin_chat_id: int) -> None:
+    users = await db_call(pending_broadcast_users)
+    sent = 0
+    failed = 0
+
+    for user in users:
+        telegram_id = user["telegram_id"]
+        promo_months = await db_call(get_promo_months, telegram_id)
+        granted = (user.get("months_earned") or 0) + promo_months
+        token = user.get("signup_token")
+        link = f"{PLATFORM_URL}/welcome/{token}" if token else PLATFORM_URL
+
+        if granted > 0:
+            text = (
+                f"Привіт! TutorSpace відкрита 🎉\n"
+                f"Тобі належить {granted} міс. Pro безкоштовно — "
+                f"заходь і реєструйся: {link}"
+            )
+        else:
+            text = (
+                f"Привіт! TutorSpace відкрита 🎉\n"
+                f"Заходь і реєструйся: {link}"
+            )
+
+        try:
+            await bot.send_message(telegram_id, text)
+            await db_call(mark_notified, telegram_id, granted)
+            sent += 1
+        except Exception:
+            log.warning("Broadcast send failed for telegram_id=%s", telegram_id)
+            failed += 1
+
+        await asyncio.sleep(1.0 / BROADCAST_RATE)
+
+    try:
+        await bot.send_message(
+            admin_chat_id,
+            f"✅ Готово. Надіслано: {sent}, не вдалось: {failed}.",
+        )
+    except Exception:
+        log.exception("Could not send broadcast summary to admin")
+
+
+# ── Lesson reschedule actions (from /notify webhook) ─────────────────────────
+
+@dp.callback_query(F.data.startswith(LESSON_CONFIRM_PREFIX))
+async def cb_lesson_confirm(callback: CallbackQuery) -> None:
+    reschedule_id = callback.data[len(LESSON_CONFIRM_PREFIX):]
+    try:
+        await db_call(_rpc_confirm_lesson, reschedule_id)
+        if callback.message:
+            await callback.message.edit_text("✅ Перенесення підтверджено.")
+        await callback.answer("Підтверджено!")
+    except Exception:
+        log.exception("confirm_lesson_reschedule failed for id=%s", reschedule_id)
+        await callback.answer("Помилка. Спробуй ще раз.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith(LESSON_REJECT_PREFIX))
+async def cb_lesson_reject(callback: CallbackQuery) -> None:
+    reschedule_id = callback.data[len(LESSON_REJECT_PREFIX):]
+    try:
+        await db_call(_rpc_reject_lesson, reschedule_id)
+        if callback.message:
+            await callback.message.edit_text("❌ Перенесення відхилено.")
+        await callback.answer("Відхилено!")
+    except Exception:
+        log.exception("reject_lesson_reschedule failed for id=%s", reschedule_id)
+        await callback.answer("Помилка. Спробуй ще раз.", show_alert=True)
 
 
 # ── Адмін: /admin, /stats, /top, /recent + reply-кнопки ──────────────────────
 
-def is_admin(message: Message) -> bool:
-    return bool(message.from_user and message.from_user.id == ADMIN_ID)
-
-
-async def reject_non_admin(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else "unknown"
-    await message.answer(
-        "Ця команда тільки для адміна.\n"
-        f"Твій Telegram ID: {user_id}\n"
-        f"ADMIN_ID у цьому запущеному боті: {ADMIN_ID}\n"
-        "Якщо це ти, постав свій ID в ADMIN_ID і перезапусти саме той інстанс, який зараз відповідає."
-    )
-
-
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
-    log.info(
-        "Incoming /admin from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
+    log.info("Incoming /admin from user_id=%s", message.from_user.id if message.from_user else None)
     if not is_admin(message):
         await reject_non_admin(message)
         return
-
     await message.answer("Адмін-меню відкрито.", reply_markup=admin_keyboard())
+
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
-    log.info(
-        "Incoming /stats from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
+    log.info("Incoming /stats from user_id=%s", message.from_user.id if message.from_user else None)
     if not is_admin(message):
         await reject_non_admin(message)
         return
 
-    total      = await db_call(total_users)
-    founders   = await db_call(founder_count)
-    waiting    = total - founders
-    promo_used = await db_call(promo_activations_total)
+    total    = await db_call(total_users)
+    founders = await db_call(founder_count)
+    waiting  = total - founders
+    pending  = await db_call(pending_broadcast_count)
     await message.answer(
         f"📋 Статистика TutorSpace:\n\n"
         f"Усього: {total}\n"
         f"Founding Members: {founders}/{FOUNDING_LIMIT}\n"
         f"У списку очікування: {waiting}\n"
-        f"Активацій промокодів: {promo_used}"
+        f"Ще не отримали розсилку: {pending}"
     )
-
-
-@dp.message(Command("promostats"))
-async def cmd_promostats(message: Message) -> None:
-    log.info(
-        "Incoming /promostats from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
-    if not is_admin(message):
-        await reject_non_admin(message)
-        return
-
-    codes = await db_call(active_promo_codes)
-    if not codes:
-        await message.answer("Активних промокодів немає 🙁")
-        return
-
-    lines = []
-    for c in codes:
-        limit = "1" if c.get("is_single_use") else (c.get("max_activations") or "∞")
-        lines.append(f"• {c['code']} — {c['activations_count']}/{limit}")
-    await message.answer("🎁 Активні промокоди:\n\n" + "\n".join(lines))
 
 
 @dp.message(Command("top"))
 async def cmd_top(message: Message) -> None:
-    log.info(
-        "Incoming /top from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
+    log.info("Incoming /top from user_id=%s", message.from_user.id if message.from_user else None)
     if not is_admin(message):
         await reject_non_admin(message)
         return
@@ -674,11 +558,7 @@ async def cmd_top(message: Message) -> None:
 
 @dp.message(Command("recent"))
 async def cmd_recent(message: Message) -> None:
-    log.info(
-        "Incoming /recent from user_id=%s username=%s",
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-    )
+    log.info("Incoming /recent from user_id=%s", message.from_user.id if message.from_user else None)
     if not is_admin(message):
         await reject_non_admin(message)
         return
@@ -722,12 +602,95 @@ async def btn_recent(message: Message) -> None:
     await cmd_recent(message)
 
 
+# ── HTTP /notify endpoint (Supabase Database Webhooks) ───────────────────────
+
+async def _dispatch_notification(chat_id: int, event_type: str, data: dict) -> None:
+    if event_type == "lesson_reschedule_request":
+        student_name  = data.get("student_name", "Учень")
+        proposed_time = data.get("proposed_time", "")
+        reschedule_id = data.get("reschedule_id", "")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Підтвердити",
+                callback_data=f"{LESSON_CONFIRM_PREFIX}{reschedule_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Відхилити",
+                callback_data=f"{LESSON_REJECT_PREFIX}{reschedule_id}",
+            ),
+        ]])
+        await bot.send_message(
+            chat_id,
+            f"📅 {student_name} просить перенести урок.\n"
+            f"Пропонований час: {proposed_time}",
+            reply_markup=kb,
+        )
+
+    elif event_type == "lesson_cancelled":
+        student_name = data.get("student_name", "Учень")
+        date = data.get("date", "")
+        await bot.send_message(chat_id, f"❌ {student_name} скасував(-ла) урок {date}.")
+
+    elif event_type == "homework_assigned":
+        title = data.get("title", "Нове завдання")
+        await bot.send_message(chat_id, f"📝 Нове домашнє завдання: {title}")
+
+    elif event_type == "grade_received":
+        subject = data.get("subject", "")
+        grade   = data.get("grade", "")
+        await bot.send_message(chat_id, f"🎓 Нова оцінка з {subject}: {grade}")
+
+    elif event_type == "payment_received":
+        amount   = data.get("amount", "")
+        currency = data.get("currency", "UAH")
+        await bot.send_message(chat_id, f"💰 Отримано платіж: {amount} {currency}")
+
+    else:
+        log.warning("Unknown event_type in /notify: %s", event_type)
+
+
+async def notify_handler(request: web.Request) -> web.Response:
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Webhook-Secret", "")
+        if secret != WEBHOOK_SECRET:
+            return web.Response(status=401, text="Unauthorized")
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+
+    event_type = data.get("event_type", "")
+    profile_id = data.get("profile_id", "")
+    event_data = data.get("data", {})
+
+    if not profile_id:
+        return web.Response(status=400, text="Missing profile_id")
+
+    chat_id = await db_call(_get_profile_chat_id, profile_id)
+    if not chat_id:
+        return web.Response(status=404, text="No telegram_chat_id for this profile")
+
+    try:
+        await _dispatch_notification(chat_id, event_type, event_data)
+    except Exception:
+        log.exception("Failed to dispatch notification for profile_id=%s", profile_id)
+        return web.Response(status=500, text="Dispatch error")
+
+    return web.Response(text="OK")
+
+
+def create_notify_app() -> web.Application:
+    app = web.Application()
+    app.router.add_post("/notify", notify_handler)
+    return app
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 @dp.error()
 async def error_handler(event) -> bool:
     log.exception("Unhandled update error", exc_info=event.exception)
-
     message = getattr(event.update, "message", None)
     callback_query = getattr(event.update, "callback_query", None)
     if message:
@@ -741,19 +704,40 @@ async def error_handler(event) -> bool:
 
 
 async def main() -> None:
+    if not WEBHOOK_SECRET:
+        log.warning("WEBHOOK_SECRET is not set — /notify endpoint accepts requests without auth")
+
     try:
-        await bot.set_my_commands([
-            BotCommand(command="start",      description="Почати / головне меню"),
-            BotCommand(command="id",         description="Показати мій Telegram ID"),
-            BotCommand(command="status",     description="Мій статус"),
-            BotCommand(command="promo",      description="Активувати промокод"),
-            BotCommand(command="admin",      description="Адмін-меню"),
-            BotCommand(command="stats",      description="Статистика для адміна"),
-            BotCommand(command="top",        description="Топ реферерів"),
-            BotCommand(command="recent",     description="Останні реєстрації"),
-            BotCommand(command="promostats", description="Статистика промокодів (адмін)"),
-        ])
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start",  description="Почати / головне меню"),
+                BotCommand(command="status", description="Мій статус у waitlist"),
+                BotCommand(command="link",   description="Прив'язати Telegram до профілю"),
+            ],
+            scope=BotCommandScopeDefault(),
+        )
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start",  description="Почати / головне меню"),
+                BotCommand(command="id",     description="Показати мій Telegram ID"),
+                BotCommand(command="status", description="Мій статус"),
+                BotCommand(command="link",   description="Прив'язати Telegram до профілю"),
+                BotCommand(command="admin",  description="Адмін-меню"),
+                BotCommand(command="stats",  description="Статистика для адміна"),
+                BotCommand(command="top",    description="Топ реферерів"),
+                BotCommand(command="recent", description="Останні реєстрації"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
         await bot.delete_webhook(drop_pending_updates=True)
+
+        notify_app = create_notify_app()
+        runner = web.AppRunner(notify_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", NOTIFY_PORT)
+        await site.start()
+        log.info("Notify webhook server listening on port %s", NOTIFY_PORT)
+
         log.info("Starting TutorSpaceBot (polling)...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except TelegramConflictError:
