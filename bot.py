@@ -374,17 +374,19 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     log.info("Incoming /start from user_id=%s username=%s", user.id, user.username)
     arg = (command.args or "").strip()
 
+    # Deep-link account linking token (40-char hex, not a referral link) —
+    # check this BEFORE the admin branch, so linking works even when the
+    # person linking is using the same Telegram account as ADMIN_ID.
+    if arg and not arg.startswith("ref_"):
+        await handle_link_token(message, arg)
+        return
+
     if user.id == ADMIN_ID:
         await message.answer(
             "👋 Привіт, адміне! Ти керуєш ботом і не рахуєшся учасником waitlist.\n"
             f"Твій ID: {user.id}\n\nКоманди: /admin, /stats, /top, /recent",
             reply_markup=admin_keyboard(),
         )
-        return
-
-    # Deep-link account linking token (40-char hex, not a referral link)
-    if arg and not arg.startswith("ref_"):
-        await handle_link_token(message, arg)
         return
 
     await message.answer(
