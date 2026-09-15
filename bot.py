@@ -324,6 +324,25 @@ def _mark_sent(lesson_id: str, column: str) -> None:
     db.table("lessons").update({column: True}).eq("id", lesson_id).execute()
 
 
+def _mark_hw_reminder_sent(hw_id: str) -> None:
+    db.table("homework").update({"reminder_sent": True}).eq("id", hw_id).execute()
+
+
+def _homework_in_window(lesson_ids: list[str]) -> list[dict]:
+    """Return homework rows for the given lessons that still need a reminder."""
+    if not lesson_ids:
+        return []
+    res = (
+        db.table("homework")
+        .select("id, lesson_id")
+        .in_("lesson_id", lesson_ids)
+        .eq("reminder_sent", False)
+        .neq("status", "completed")
+        .execute()
+    )
+    return res.data or []
+
+
 def _lessons_in_window(minutes_from: int, minutes_to: int, sent_col: str) -> list[dict]:
     now = datetime.now(timezone.utc)
     window_start = (now + timedelta(minutes=minutes_from)).isoformat()
@@ -384,6 +403,45 @@ async def send_reminders() -> None:
             await db_call(_mark_sent, lesson["id"], "reminder_1h_sent")
         except Exception:
             log.exception("1h reminder failed for lesson_id=%s", lesson.get("id"))
+
+    # Homework reminders (24h before lesson)
+    lessons_24h_all = await db_call(_lessons_in_window, 23 * 60 + 57, 24 * 60 + 3, "reminder_24h_sent")
+    # Include lessons whose 24h reminder was already sent in a previous cycle
+    # so homework reminders still fire even if reminder_24h_sent is already true.
+    now = datetime.now(timezone.utc)
+    w_start = (now + timedelta(minutes=23 * 60 + 57)).isoformat()
+    w_end   = (now + timedelta(minutes=24 * 60 + 3)).isoformat()
+    all_24h_lessons = await db_call(
+        lambda: db.table("lessons")
+        .select("id, teacher_id, student_id, starts_at")
+        .eq("status", "planned")
+        .gte("starts_at", w_start)
+        .lte("starts_at", w_end)
+        .execute()
+    )
+    lesson_map = {r["id"]: r for r in (all_24h_lessons.data or [])}
+    hw_rows = await db_call(_homework_in_window, list(lesson_map.keys()))
+    for hw in hw_rows:
+        try:
+            lesson = lesson_map.get(hw["lesson_id"])
+            if not lesson:
+                continue
+            ts_row = await db_call(_get_ts_row, lesson["student_id"])
+            if not ts_row or not ts_row.get("student_id"):
+                continue
+            student_tg = await db_call(_get_profile_tg, ts_row["student_id"])
+            if not student_tg:
+                continue
+            teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+            time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m о %H:%M")
+            await bot.send_message(
+                student_tg,
+                f"Не забудь зробити домашнє завдання до уроку з {teacher_name} {time_str}.",
+            )
+            await db_call(_mark_hw_reminder_sent, hw["id"])
+        except Exception:
+            log.exception("homework reminder failed for hw_id=%s", hw.get("id"))
 
 
 async def reminder_loop() -> None:
