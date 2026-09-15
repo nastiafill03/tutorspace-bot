@@ -7,15 +7,16 @@ from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from typing import TypeVar
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramConflictError
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, Command, CommandObject, BaseFilter
 from aiogram.types import (
     Message,
     CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand,
     BotCommandScopeDefault, BotCommandScopeChat,
@@ -45,6 +46,13 @@ CANCEL_LAUNCH_CALLBACK  = "cancel_launch"
 # Lesson action callbacks carry the request id: "lesson_confirm:<id>" / "lesson_reject:<id>"
 LESSON_CONFIRM_PREFIX = "lesson_confirm:"
 LESSON_REJECT_PREFIX  = "lesson_reject:"
+RESCHEDULE_PREFIX     = "reschedule_req:"
+LESSON_OK_PREFIX      = "lesson_ok:"
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# In-memory state: {telegram_user_id: {teacher_id, starts_at}}
+_reschedule_pending: dict[int, dict] = {}
 
 # ── Init ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -279,6 +287,114 @@ def _rpc_reject_lesson(reschedule_id: str):
     return db.rpc("reject_lesson_reschedule", {"p_reschedule_id": reschedule_id}).execute()
 
 
+def _get_lesson(lesson_id: str) -> dict | None:
+    res = (
+        db.table("lessons")
+        .select("id, teacher_id, student_id, starts_at")
+        .eq("id", lesson_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _get_ts_row(ts_id: str) -> dict | None:
+    """Get teacher_students row; lessons.student_id is teacher_students.id."""
+    res = (
+        db.table("teacher_students")
+        .select("student_id, student_name")
+        .eq("id", ts_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _get_profile_name(profile_id: str) -> str | None:
+    res = db.table("profiles").select("full_name").eq("id", profile_id).execute()
+    return res.data[0]["full_name"] if res.data else None
+
+
+def _get_profile_tg(profile_id: str) -> int | None:
+    res = db.table("profiles").select("telegram_user_id").eq("id", profile_id).execute()
+    if res.data and res.data[0].get("telegram_user_id"):
+        return int(res.data[0]["telegram_user_id"])
+    return None
+
+
+def _mark_sent(lesson_id: str, column: str) -> None:
+    db.table("lessons").update({column: True}).eq("id", lesson_id).execute()
+
+
+def _lessons_in_window(minutes_from: int, minutes_to: int, sent_col: str) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    window_start = (now + timedelta(minutes=minutes_from)).isoformat()
+    window_end   = (now + timedelta(minutes=minutes_to)).isoformat()
+    res = (
+        db.table("lessons")
+        .select("id, teacher_id, student_id, starts_at")
+        .eq("status", "planned")
+        .eq(sent_col, False)
+        .gte("starts_at", window_start)
+        .lte("starts_at", window_end)
+        .execute()
+    )
+    return res.data or []
+
+
+# ── Reminder loop ─────────────────────────────────────────────────────────────
+
+async def send_reminders() -> None:
+    # 24h window: 23h57m – 24h03m
+    for lesson in await db_call(_lessons_in_window, 23 * 60 + 57, 24 * 60 + 3, "reminder_24h_sent"):
+        try:
+            ts_row = await db_call(_get_ts_row, lesson["student_id"])
+            if not ts_row or not ts_row.get("student_id"):
+                continue
+            student_tg = await db_call(_get_profile_tg, ts_row["student_id"])
+            if not student_tg:
+                continue
+            teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+            time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Перенести", callback_data=f"{RESCHEDULE_PREFIX}{lesson['id']}"),
+                InlineKeyboardButton(text="Все ок",    callback_data=f"{LESSON_OK_PREFIX}{lesson['id']}"),
+            ]])
+            await bot.send_message(
+                student_tg,
+                f"Завтра о {time_str} у тебе урок з {teacher_name}.",
+                reply_markup=kb,
+            )
+            await db_call(_mark_sent, lesson["id"], "reminder_24h_sent")
+        except Exception:
+            log.exception("24h reminder failed for lesson_id=%s", lesson.get("id"))
+
+    # 1h window: 57m – 63m
+    for lesson in await db_call(_lessons_in_window, 57, 63, "reminder_1h_sent"):
+        try:
+            ts_row = await db_call(_get_ts_row, lesson["student_id"])
+            if not ts_row or not ts_row.get("student_id"):
+                continue
+            student_tg = await db_call(_get_profile_tg, ts_row["student_id"])
+            if not student_tg:
+                continue
+            teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+            time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+            await bot.send_message(student_tg, f"За годину у тебе урок з {teacher_name}.")
+            await db_call(_mark_sent, lesson["id"], "reminder_1h_sent")
+        except Exception:
+            log.exception("1h reminder failed for lesson_id=%s", lesson.get("id"))
+
+
+async def reminder_loop() -> None:
+    while True:
+        try:
+            await send_reminders()
+        except Exception:
+            log.exception("reminder_loop crashed")
+        await asyncio.sleep(5 * 60)
+
+
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
 async def ref_link_for(user_id: int) -> str:
@@ -469,6 +585,71 @@ async def cmd_link(message: Message, command: CommandObject) -> None:
     except Exception:
         log.exception("RPC link_telegram failed for chat_id=%s", chat_id)
         await message.answer("❌ Сталася помилка. Спробуй ще раз або зверніться до підтримки.")
+
+
+# ── Lesson reminders: "Перенести" / "Все ок" callbacks ───────────────────────
+
+@dp.callback_query(F.data.startswith(RESCHEDULE_PREFIX))
+async def cb_reschedule_request(callback: CallbackQuery) -> None:
+    lesson_id = callback.data[len(RESCHEDULE_PREFIX):]
+    lesson = await db_call(_get_lesson, lesson_id)
+    if not lesson:
+        await callback.answer("Урок не знайдено.", show_alert=True)
+        return
+
+    starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+    time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
+    _reschedule_pending[callback.from_user.id] = {
+        "teacher_id": lesson["teacher_id"],
+        "starts_at":  lesson["starts_at"],
+    }
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Без причини")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    if callback.message:
+        await callback.message.answer(
+            f"Напиши причину переносу уроку {time_str} або натисни «Без причини»:",
+            reply_markup=kb,
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith(LESSON_OK_PREFIX))
+async def cb_lesson_ok(callback: CallbackQuery) -> None:
+    await callback.answer("Чудово! Побачимось на уроці 👍")
+
+
+class _AwaitingRescheduleReason(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return bool(message.from_user and message.from_user.id in _reschedule_pending)
+
+
+@dp.message(_AwaitingRescheduleReason(), F.text)
+async def handle_reschedule_reason(message: Message) -> None:
+    state = _reschedule_pending.pop(message.from_user.id)
+    reason_text = (message.text or "").strip()
+    reason_display = "не вказана" if reason_text in ("Без причини", "") else reason_text
+
+    starts = datetime.fromisoformat(state["starts_at"].replace("Z", "+00:00"))
+    time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
+    student_name = message.from_user.full_name or "Учень"
+
+    teacher_tg = await db_call(_get_profile_tg, state["teacher_id"])
+    if teacher_tg:
+        try:
+            await bot.send_message(
+                teacher_tg,
+                f"{student_name} хоче перенести урок {time_str}. Причина: {reason_display}.",
+            )
+        except Exception:
+            log.exception("Failed to notify teacher about reschedule, teacher_id=%s", state["teacher_id"])
+
+    await message.answer(
+        "Повідомлення надіслано. Домовся з вчителем про новий час окремо — бот тут не узгоджує заміну.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 # ── Broadcast: кнопка "🚀 Запустити платформу" ───────────────────────────────
@@ -820,6 +1001,7 @@ async def main() -> None:
         log.info("Notify webhook server listening on port %s", NOTIFY_PORT)
 
         log.info("Starting TutorSpaceBot (polling)...")
+        asyncio.create_task(reminder_loop())
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except TelegramConflictError:
         log.error("Polling conflict: stop other running bot instances or disable webhook.")
