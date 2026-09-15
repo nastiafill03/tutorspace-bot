@@ -244,13 +244,31 @@ def _rpc_link_telegram(code: str, chat_id: int):
 def _get_profile_chat_id(profile_id: str) -> int | None:
     res = (
         db.table("profiles")
-        .select("telegram_chat_id")
+        .select("telegram_user_id")
         .eq("id", profile_id)
         .execute()
     )
-    if res.data and res.data[0].get("telegram_chat_id"):
-        return int(res.data[0]["telegram_chat_id"])
+    if res.data and res.data[0].get("telegram_user_id"):
+        return int(res.data[0]["telegram_user_id"])
     return None
+
+
+def _lookup_link_token(token: str) -> dict | None:
+    res = (
+        db.table("telegram_link_tokens")
+        .select("user_id, created_at")
+        .eq("token", token)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _link_telegram_user(profile_id: str, telegram_user_id: int) -> None:
+    db.table("profiles").update({"telegram_user_id": telegram_user_id}).eq("id", profile_id).execute()
+
+
+def _delete_link_token(token: str) -> None:
+    db.table("telegram_link_tokens").delete().eq("token", token).execute()
 
 
 def _rpc_confirm_lesson(reschedule_id: str):
@@ -295,10 +313,66 @@ async def reject_non_admin(message: Message) -> None:
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
+async def handle_link_token(message: Message, token: str) -> None:
+    """Handle deep-link Telegram account linking via /start <token>."""
+    try:
+        row = await db_call(_lookup_link_token, token)
+    except Exception:
+        log.exception("DB error looking up link token")
+        await message.answer("❌ Сталася помилка. Спробуй ще раз або зверніться до підтримки.")
+        return
+
+    if not row:
+        await message.answer(
+            "❌ Посилання недійсне або вже використане.\n"
+            "Створи нове в профілі на сайті TutorSpace."
+        )
+        return
+
+    created_at = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+    if datetime.now(timezone.utc) - created_at > timedelta(minutes=15):
+        try:
+            await db_call(_delete_link_token, token)
+        except Exception:
+            pass
+        await message.answer(
+            "⏰ Посилання прострочене (дійсне 15 хвилин).\n"
+            "Створи нове в профілі на сайті TutorSpace."
+        )
+        return
+
+    profile_id = row["user_id"]
+    telegram_user_id = message.from_user.id
+
+    try:
+        await db_call(_link_telegram_user, profile_id, telegram_user_id)
+        await db_call(_delete_link_token, token)
+    except Exception:
+        log.exception("Failed to link telegram_user_id=%s to profile_id=%s", telegram_user_id, profile_id)
+        await message.answer("❌ Сталася помилка. Спробуй ще раз або зверніться до підтримки.")
+        return
+
+    try:
+        role_res = await db_call(
+            lambda pid: db.table("profiles").select("role").eq("id", pid).execute(),
+            profile_id,
+        )
+        role = (role_res.data[0].get("role") if role_res.data else None) or ""
+    except Exception:
+        role = ""
+
+    role_label = "викладача" if role == "teacher" else "учня" if role == "student" else "користувача"
+    await message.answer(
+        f"✅ Telegram успішно прив'язано до акаунту {role_label} на TutorSpace!\n"
+        "Тепер будеш отримувати сповіщення про уроки та платежі тут."
+    )
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     user = message.from_user
     log.info("Incoming /start from user_id=%s username=%s", user.id, user.username)
+    arg = (command.args or "").strip()
 
     if user.id == ADMIN_ID:
         await message.answer(
@@ -306,6 +380,11 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
             f"Твій ID: {user.id}\n\nКоманди: /admin, /stats, /top, /recent",
             reply_markup=admin_keyboard(),
         )
+        return
+
+    # Deep-link account linking token (40-char hex, not a referral link)
+    if arg and not arg.startswith("ref_"):
+        await handle_link_token(message, arg)
         return
 
     await message.answer(
