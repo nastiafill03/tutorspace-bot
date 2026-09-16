@@ -1589,8 +1589,10 @@ async def _run_support_bot() -> None:
         log.info("Starting SupportBot (polling)...")
         await support_dp.start_polling(support_bot, allowed_updates=support_dp.resolve_used_update_types())
     except TelegramConflictError:
-        log.error("SupportBot polling conflict.")
+        log.error("SupportBot polling conflict — stop duplicate instances.")
         raise
+    except Exception:
+        log.exception("SupportBot crashed — main bot keeps running.")
     finally:
         await support_bot.session.close()
 
@@ -1632,14 +1634,14 @@ async def main() -> None:
 
         log.info("Starting TutorSpaceBot (polling)...")
         asyncio.create_task(reminder_loop())
-
-        pollers = [dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())]
         if support_bot:
-            pollers.append(_run_support_bot())
-        await asyncio.gather(*pollers)
-    except TelegramConflictError:
-        log.error("Polling conflict: stop other running bot instances or disable webhook.")
-        raise
+            asyncio.create_task(_run_support_bot())
+
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        except TelegramConflictError:
+            log.error("Polling conflict: stop other running bot instances or disable webhook.")
+            raise
     finally:
         await bot.session.close()
 
