@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from typing import TypeVar
@@ -353,6 +354,102 @@ def _save_support_reply(row_id: str, reply: str) -> None:
         "admin_reply": reply,
         "replied_at":  datetime.now(timezone.utc).isoformat(),
     }).eq("id", row_id).execute()
+
+
+def _find_support_by_id(support_msg_id: str) -> dict | None:
+    res = (
+        db.table("support_messages")
+        .select("id, sender_telegram_id, sender_name, sender_profile_id, sender_role")
+        .eq("id", support_msg_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _debug_snapshot(profile_id: str, role: str) -> str:
+    res = db.table("profiles").select("full_name, telegram_user_id, created_at").eq("id", profile_id).execute()
+    if not res.data:
+        return "Профіль не знайдено."
+    p = res.data[0]
+    name = p.get("full_name") or "—"
+    tg_id = p.get("telegram_user_id") or "—"
+    try:
+        reg = datetime.fromisoformat(p["created_at"].replace("Z", "+00:00")).astimezone(KYIV_TZ)
+        reg_str = reg.strftime("%-d %b %Y")
+    except Exception:
+        reg_str = "—"
+
+    if role == "teacher":
+        students_res = (
+            db.table("teacher_students").select("id", count="exact")
+            .eq("teacher_id", profile_id).eq("is_active", True).execute()
+        )
+        students_count = students_res.count or 0
+
+        now = datetime.now(timezone.utc)
+        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = week_start + timedelta(days=7)
+        lessons_res = (
+            db.table("lessons").select("id", count="exact")
+            .eq("teacher_id", profile_id).eq("status", "planned")
+            .gte("starts_at", week_start.isoformat()).lt("starts_at", week_end.isoformat())
+            .execute()
+        )
+        lessons_week = lessons_res.count or 0
+
+        hw_submitted = len(_teacher_hw_submitted(profile_id))
+
+        pay_res = (
+            db.table("payment_notifications").select("id", count="exact")
+            .eq("teacher_id", profile_id).eq("is_read", False).execute()
+        )
+        unpaid = pay_res.count or 0
+
+        return (
+            f"👤 {name}\n"
+            f"🆔 Telegram ID: {tg_id}\n"
+            f"📅 Реєстрація: {reg_str}\n\n"
+            f"👥 Учнів: {students_count}\n"
+            f"📆 Уроків цього тижня: {lessons_week}\n"
+            f"📝 ДЗ на перевірці: {hw_submitted}\n"
+            f"💳 Непідтверджених оплат: {unpaid}"
+        )
+
+    # student
+    ts_res = (
+        db.table("teacher_students").select("id, teacher_id, lesson_balance")
+        .eq("student_id", profile_id).eq("is_active", True).execute()
+    )
+    ts_rows = ts_res.data or []
+    ts_ids = [r["id"] for r in ts_rows]
+
+    teacher_lines = []
+    for ts in ts_rows:
+        t_res = db.table("profiles").select("full_name").eq("id", ts["teacher_id"]).execute()
+        t_name = t_res.data[0]["full_name"] if t_res.data else "—"
+        teacher_lines.append(f"  • {t_name} — баланс: {ts.get('lesson_balance', 0)} ур.")
+    teachers_text = "\n".join(teacher_lines) if teacher_lines else "  —"
+
+    upcoming = len(_student_lessons_upcoming(ts_ids)) if ts_ids else 0
+
+    hw_all = _student_homework_list(ts_ids) if ts_ids else []
+    status_labels = {
+        "assigned": "призначено",
+        "submitted": "здано",
+        "revision_requested": "на доопрацюванні",
+        "completed": "завершено",
+    }
+    counts = Counter(hw["status"] for hw in hw_all)
+    hw_lines = [f"  {status_labels.get(s, s)}: {n}" for s, n in counts.items()] if counts else ["  —"]
+
+    return (
+        f"👤 {name}\n"
+        f"🆔 Telegram ID: {tg_id}\n"
+        f"📅 Реєстрація: {reg_str}\n\n"
+        f"🎓 Викладачі:\n{teachers_text}\n\n"
+        f"📆 Найближчих уроків: {upcoming}\n\n"
+        f"📚 Домашні завдання:\n" + "\n".join(hw_lines)
+    )
 
 
 def _teacher_lessons_7days(teacher_id: str) -> list[dict]:
@@ -1418,15 +1515,49 @@ async def support_handle_message(message: Message) -> None:
     sender_role = profile["role"] if profile else "unknown"
     row_id = _insert_support_message(uid, profile["id"] if profile else None, sender_role, sender_name, message.text or "")
     try:
+        kb = None
+        if row_id:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔍 Дані користувача",
+                    callback_data=f"support_debug:{row_id}",
+                )
+            ]])
         forwarded = await support_bot.send_message(
             ADMIN_ID,
             f"📩 Підтримка від {sender_name} (@{username or uid}):\n\n{message.text}",
+            reply_markup=kb,
         )
         if row_id:
             _update_support_admin_msg_id(row_id, forwarded.message_id)
     except Exception:
         log.warning("Could not forward support message to admin")
     await message.reply("Дякуємо! Ми отримали твоє повідомлення та відповімо найближчим часом.")
+
+
+@support_dp.callback_query(F.data.startswith("support_debug:"))
+async def support_debug_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+
+    support_msg_id = callback.data.split(":", 1)[1]
+    row = _find_support_by_id(support_msg_id)
+    if not row:
+        await callback.answer("Повідомлення не знайдено.", show_alert=True)
+        return
+
+    profile_id = row.get("sender_profile_id")
+    role = row.get("sender_role") or "unknown"
+
+    if not profile_id:
+        await callback.answer()
+        await callback.message.answer("Профіль не знайдено — акаунт не прив'язаний до платформи.")
+        return
+
+    snapshot = _debug_snapshot(profile_id, role)
+    await callback.answer()
+    await callback.message.answer(snapshot)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
