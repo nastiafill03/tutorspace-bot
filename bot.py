@@ -40,6 +40,15 @@ BTN_TOP      = "🏆 Топ реферери"
 BTN_RECENT   = "🆕 Останні реєстрації"
 BTN_LAUNCH   = "🚀 Запустити платформу"
 
+BTN_TEACHER_SCHEDULE = "📅 Розклад"
+BTN_TEACHER_HW       = "📝 Домашні завдання"
+BTN_STUDENT_LESSONS  = "📅 Мої уроки"
+BTN_STUDENT_HW       = "📝 Моє ДЗ"
+BTN_PLATFORM         = "🌐 Відкрити платформу"
+
+MONTH_UK = ["січня","лютого","березня","квітня","травня","червня",
+            "липня","серпня","вересня","жовтня","листопада","грудня"]
+
 STATUS_CALLBACK        = "show_status"
 CONFIRM_LAUNCH_CALLBACK = "confirm_launch"
 CANCEL_LAUNCH_CALLBACK  = "cancel_launch"
@@ -132,6 +141,36 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         persistent=True,
     )
+
+
+def teacher_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_TEACHER_SCHEDULE), KeyboardButton(text=BTN_TEACHER_HW)],
+            [KeyboardButton(text=BTN_PLATFORM)],
+        ],
+        resize_keyboard=True,
+        persistent=True,
+    )
+
+
+def student_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_STUDENT_LESSONS), KeyboardButton(text=BTN_STUDENT_HW)],
+            [KeyboardButton(text=BTN_PLATFORM)],
+        ],
+        resize_keyboard=True,
+        persistent=True,
+    )
+
+
+def role_keyboard(role: str) -> ReplyKeyboardMarkup | None:
+    if role == "teacher":
+        return teacher_menu_keyboard()
+    if role == "student":
+        return student_menu_keyboard()
+    return None
 
 
 # ── DB helpers — waitlist ─────────────────────────────────────────────────────
@@ -259,6 +298,100 @@ def _get_profile_chat_id(profile_id: str) -> int | None:
     if res.data and res.data[0].get("telegram_user_id"):
         return int(res.data[0]["telegram_user_id"])
     return None
+
+
+def _get_profile_by_tg(telegram_user_id: int) -> dict | None:
+    res = (
+        db.table("profiles")
+        .select("id, role, full_name")
+        .eq("telegram_user_id", telegram_user_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _teacher_lessons_7days(teacher_id: str) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=7)
+    res = (
+        db.table("lessons")
+        .select("id, student_id, starts_at")
+        .eq("teacher_id", teacher_id)
+        .eq("status", "planned")
+        .gte("starts_at", now.isoformat())
+        .lte("starts_at", end.isoformat())
+        .order("starts_at")
+        .execute()
+    )
+    return res.data or []
+
+
+def _teacher_hw_submitted(teacher_id: str) -> list[dict]:
+    res = (
+        db.table("homework")
+        .select("id, student_id, title, submitted_at")
+        .eq("teacher_id", teacher_id)
+        .eq("status", "submitted")
+        .order("submitted_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+
+def _teacher_hw_assigned_soon(teacher_id: str) -> list[dict]:
+    end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    res = (
+        db.table("homework")
+        .select("id, student_id, title, deadline")
+        .eq("teacher_id", teacher_id)
+        .eq("status", "assigned")
+        .lte("deadline", end)  # NULL deadlines excluded by PostgREST automatically
+        .order("deadline")
+        .execute()
+    )
+    return res.data or []
+
+
+def _student_ts_ids(profile_id: str) -> list[str]:
+    res = (
+        db.table("teacher_students")
+        .select("id")
+        .eq("student_id", profile_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return [r["id"] for r in (res.data or [])]
+
+
+def _student_lessons_upcoming(ts_ids: list[str]) -> list[dict]:
+    if not ts_ids:
+        return []
+    now = datetime.now(timezone.utc)
+    res = (
+        db.table("lessons")
+        .select("id, teacher_id, starts_at")
+        .in_("student_id", ts_ids)
+        .eq("status", "planned")
+        .gte("starts_at", now.isoformat())
+        .order("starts_at")
+        .limit(5)
+        .execute()
+    )
+    return res.data or []
+
+
+def _student_homework_list(ts_ids: list[str]) -> list[dict]:
+    if not ts_ids:
+        return []
+    res = (
+        db.table("homework")
+        .select("id, title, deadline, status")
+        .in_("student_id", ts_ids)
+        .order("deadline")
+        .limit(15)
+        .execute()
+    )
+    return res.data or []
 
 
 def _lookup_link_token(token: str) -> dict | None:
@@ -538,7 +671,8 @@ async def handle_link_token(message: Message, token: str) -> None:
     role_label = "викладача" if role == "teacher" else "учня" if role == "student" else "користувача"
     await message.answer(
         f"✅ Telegram успішно прив'язано до акаунту {role_label} на TutorSpace!\n"
-        "Тепер будеш отримувати сповіщення про уроки та платежі тут."
+        "Тепер будеш отримувати сповіщення про уроки та платежі тут.",
+        reply_markup=role_keyboard(role),
     )
 
 
@@ -569,6 +703,176 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         f"Якщо ти отримав(-ла) персональне посилання — скористайся ним: там враховані "
         f"твої бонуси. Якщо ні — реєструйся за звичайним посиланням вище."
     )
+
+
+# ── /menu + меню вчителя / учня ───────────────────────────────────────────────
+
+def _day_label(dt: datetime) -> str:
+    local = dt.astimezone(KYIV_TZ)
+    today = datetime.now(KYIV_TZ).date()
+    if local.date() == today:
+        return "Сьогодні"
+    if local.date() == today + timedelta(days=1):
+        return "Завтра"
+    return f"{local.day} {MONTH_UK[local.month - 1]}"
+
+
+async def _require_profile(message: Message) -> dict | None:
+    """Return linked profile or send 'not linked' message and return None."""
+    profile = await db_call(_get_profile_by_tg, message.from_user.id)
+    if not profile:
+        await message.answer(
+            "Ти ще не підключив(-ла) Telegram до платформи.\n"
+            f"Зайди в профіль на {PLATFORM_URL} і натисни «Підключити Telegram»."
+        )
+    return profile
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile:
+        return
+    kb = role_keyboard(profile["role"])
+    if kb:
+        await message.answer("Головне меню:", reply_markup=kb)
+    else:
+        await message.answer(f"Платформа: {PLATFORM_URL}")
+
+
+@dp.message(F.text == BTN_TEACHER_SCHEDULE)
+async def btn_teacher_schedule(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile or profile["role"] != "teacher":
+        await message.answer("Ця кнопка доступна тільки для викладачів.")
+        return
+
+    lessons = await db_call(_teacher_lessons_7days, profile["id"])
+    if not lessons:
+        await message.answer("Найближчим часом уроків не заплановано.")
+        return
+
+    # Group by day
+    groups: dict[str, list[str]] = {}
+    for lesson in lessons:
+        starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+        day = _day_label(starts)
+        time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+        ts_row = await db_call(_get_ts_row, lesson["student_id"])
+        student_name = ts_row["student_name"] if ts_row else "—"
+        groups.setdefault(day, []).append(f"  {time_str} — {student_name}")
+
+    lines = []
+    for day, items in groups.items():
+        lines.append(f"📅 {day}:")
+        lines.extend(items)
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_TEACHER_HW)
+async def btn_teacher_hw(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile or profile["role"] != "teacher":
+        await message.answer("Ця кнопка доступна тільки для викладачів.")
+        return
+
+    submitted = await db_call(_teacher_hw_submitted, profile["id"])
+    assigned_soon = await db_call(_teacher_hw_assigned_soon, profile["id"])
+
+    lines: list[str] = []
+
+    if submitted:
+        lines.append("🔎 Очікують перевірки:")
+        for hw in submitted:
+            ts_row = await db_call(_get_ts_row, hw["student_id"])
+            name = ts_row["student_name"] if ts_row else "—"
+            date_str = ""
+            if hw.get("submitted_at"):
+                d = datetime.fromisoformat(hw["submitted_at"].replace("Z", "+00:00"))
+                date_str = f" (здано {d.astimezone(KYIV_TZ).strftime('%-d.%-m')})"
+            lines.append(f"  {name} — «{hw['title']}»{date_str}")
+
+    if assigned_soon:
+        if lines:
+            lines.append("")
+        lines.append("⏳ Ще не здали (дедлайн найближчим часом):")
+        for hw in assigned_soon:
+            ts_row = await db_call(_get_ts_row, hw["student_id"])
+            name = ts_row["student_name"] if ts_row else "—"
+            date_str = ""
+            if hw.get("deadline"):
+                d = datetime.fromisoformat(hw["deadline"].replace("Z", "+00:00"))
+                date_str = f" (до {d.astimezone(KYIV_TZ).strftime('%-d.%-m')})"
+            lines.append(f"  {name} — «{hw['title']}»{date_str}")
+
+    if not lines:
+        await message.answer("Все виконано, перевіряти нема чого 🎉")
+        return
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_STUDENT_LESSONS)
+async def btn_student_lessons(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile or profile["role"] != "student":
+        await message.answer("Ця кнопка доступна тільки для учнів.")
+        return
+
+    ts_ids = await db_call(_student_ts_ids, profile["id"])
+    lessons = await db_call(_student_lessons_upcoming, ts_ids)
+    if not lessons:
+        await message.answer("Найближчих уроків не заплановано.")
+        return
+
+    lines = []
+    for lesson in lessons:
+        starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+        dt_str = starts.astimezone(KYIV_TZ).strftime("%-d.%-m %H:%M")
+        teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+        lines.append(f"{dt_str} — урок з {teacher_name}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_STUDENT_HW)
+async def btn_student_hw(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile or profile["role"] != "student":
+        await message.answer("Ця кнопка доступна тільки для учнів.")
+        return
+
+    ts_ids = await db_call(_student_ts_ids, profile["id"])
+    hw_list = await db_call(_student_homework_list, ts_ids)
+    if not hw_list:
+        await message.answer("Домашніх завдань немає.")
+        return
+
+    STATUS_LABELS = {
+        "assigned":           "🔴 Не здано",
+        "submitted":          "🟡 На перевірці",
+        "revision_requested": "🟠 Потрібно доопрацювати",
+        "completed":          "✅ Виконано",
+    }
+    lines = []
+    for hw in hw_list:
+        label = STATUS_LABELS.get(hw.get("status", ""), "—")
+        date_str = ""
+        if hw.get("deadline"):
+            d = datetime.fromisoformat(hw["deadline"].replace("Z", "+00:00"))
+            date_str = f", до {d.astimezone(KYIV_TZ).strftime('%-d.%-m')}"
+        lines.append(f"{label} «{hw['title']}»{date_str}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_PLATFORM)
+async def btn_platform(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile:
+        return
+    if profile["role"] == "teacher":
+        await message.answer(f"Платформа (вчитель): {PLATFORM_URL}/teacher/dashboard")
+    else:
+        await message.answer(f"Платформа (учень): {PLATFORM_URL}/student/home")
 
 
 # ── /status + кнопка "📊 Мій статус" ──────────────────────────────────────────
