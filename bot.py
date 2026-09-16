@@ -45,6 +45,7 @@ BTN_TEACHER_HW       = "📝 Домашні завдання"
 BTN_STUDENT_LESSONS  = "📅 Мої уроки"
 BTN_STUDENT_HW       = "📝 Моє ДЗ"
 BTN_PLATFORM         = "🌐 Відкрити платформу"
+BTN_SUPPORT          = "🆘 Підтримка"
 
 MONTH_UK = ["січня","лютого","березня","квітня","травня","червня",
             "липня","серпня","вересня","жовтня","листопада","грудня"]
@@ -83,9 +84,11 @@ try:
 except ValueError as exc:
     raise RuntimeError("ADMIN_ID must be a numeric Telegram user id") from exc
 PLATFORM_URL    = required_env("PLATFORM_URL")
-INSTAGRAM_URL   = os.environ.get("INSTAGRAM_URL", "").strip()
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "").strip()
-NOTIFY_PORT     = int(os.environ.get("NOTIFY_PORT", "8080"))
+INSTAGRAM_URL        = os.environ.get("INSTAGRAM_URL", "").strip()
+WEBHOOK_SECRET       = os.environ.get("WEBHOOK_SECRET", "").strip()
+NOTIFY_PORT          = int(os.environ.get("NOTIFY_PORT", "8080"))
+SUPPORT_BOT_TOKEN    = os.environ.get("SUPPORT_BOT_TOKEN", "").strip()
+SUPPORT_BOT_USERNAME = os.environ.get("SUPPORT_BOT_USERNAME", "").strip()
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -95,6 +98,10 @@ db: Client = create_client(
     options=ClientOptions(postgrest_client_timeout=12, storage_client_timeout=12),
 )
 bot_username_cache: str | None = None
+
+# Support bot (optional — only active when SUPPORT_BOT_TOKEN is set)
+support_bot: Bot | None = Bot(token=SUPPORT_BOT_TOKEN) if SUPPORT_BOT_TOKEN else None
+support_dp  = Dispatcher()
 
 
 async def db_call(func: Callable[..., T], *args, **kwargs) -> T:
@@ -147,7 +154,7 @@ def teacher_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_TEACHER_SCHEDULE), KeyboardButton(text=BTN_TEACHER_HW)],
-            [KeyboardButton(text=BTN_PLATFORM)],
+            [KeyboardButton(text=BTN_PLATFORM),         KeyboardButton(text=BTN_SUPPORT)],
         ],
         resize_keyboard=True,
         persistent=True,
@@ -158,7 +165,7 @@ def student_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_STUDENT_LESSONS), KeyboardButton(text=BTN_STUDENT_HW)],
-            [KeyboardButton(text=BTN_PLATFORM)],
+            [KeyboardButton(text=BTN_PLATFORM),        KeyboardButton(text=BTN_SUPPORT)],
         ],
         resize_keyboard=True,
         persistent=True,
@@ -308,6 +315,44 @@ def _get_profile_by_tg(telegram_user_id: int) -> dict | None:
         .execute()
     )
     return res.data[0] if res.data else None
+
+
+def _insert_support_message(
+    sender_tg_id: int,
+    profile_id: str | None,
+    role: str,
+    name: str,
+    text: str,
+) -> str | None:
+    res = db.table("support_messages").insert({
+        "sender_telegram_id": sender_tg_id,
+        "sender_profile_id":  profile_id,
+        "sender_role":        role,
+        "sender_name":        name,
+        "message":            text,
+    }).execute()
+    return res.data[0]["id"] if res.data else None
+
+
+def _update_support_admin_msg_id(row_id: str, admin_message_id: int) -> None:
+    db.table("support_messages").update({"admin_message_id": admin_message_id}).eq("id", row_id).execute()
+
+
+def _find_support_by_admin_msg(admin_message_id: int) -> dict | None:
+    res = (
+        db.table("support_messages")
+        .select("id, sender_telegram_id, sender_name")
+        .eq("admin_message_id", admin_message_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _save_support_reply(row_id: str, reply: str) -> None:
+    db.table("support_messages").update({
+        "admin_reply": reply,
+        "replied_at":  datetime.now(timezone.utc).isoformat(),
+    }).eq("id", row_id).execute()
 
 
 def _teacher_lessons_7days(teacher_id: str) -> list[dict]:
@@ -875,6 +920,20 @@ async def btn_platform(message: Message) -> None:
         await message.answer(f"Платформа (учень): {PLATFORM_URL}/student/home")
 
 
+@dp.message(F.text == BTN_SUPPORT)
+async def btn_support(message: Message) -> None:
+    if SUPPORT_BOT_USERNAME:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Написати в підтримку",
+                url=f"https://t.me/{SUPPORT_BOT_USERNAME}",
+            )
+        ]])
+        await message.answer("Напиши нам напряму — швидше відповімо 🙂", reply_markup=kb)
+    else:
+        await message.answer(f"Зв'яжись з нами через платформу: {PLATFORM_URL}")
+
+
 # ── /status + кнопка "📊 Мій статус" ──────────────────────────────────────────
 
 @dp.message(Command("id"))
@@ -1310,6 +1369,66 @@ def create_notify_app() -> web.Application:
     return app
 
 
+# ── Support bot handlers ───────────────────────────────────────────────────────
+
+@support_dp.message(Command("start"))
+async def support_start(message: Message) -> None:
+    if not support_bot:
+        return
+    if message.from_user and message.from_user.id == ADMIN_ID:
+        await message.answer(
+            "Привіт, адміне! Тут збираються повідомлення від користувачів. "
+            "Відповідай реплаєм на будь-яке з них.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer(
+            "Привіт! Напиши своє питання чи проблему — ми відповімо якнайшвидше.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
+@support_dp.message(F.text)
+async def support_handle_message(message: Message) -> None:
+    if not support_bot:
+        return
+    uid = message.from_user.id if message.from_user else 0
+    username = message.from_user.username if message.from_user else None
+
+    # Admin replying to a forwarded user message
+    if uid == ADMIN_ID and message.reply_to_message:
+        original = _find_support_by_admin_msg(message.reply_to_message.message_id)
+        if original:
+            _save_support_reply(original["id"], message.text or "")
+            try:
+                await support_bot.send_message(
+                    original["sender_telegram_id"],
+                    f"Відповідь підтримки:\n{message.text}",
+                )
+                await message.reply("Відповідь надіслано ✅")
+            except Exception:
+                await message.reply("Не вдалося надіслати відповідь користувачу.")
+        else:
+            await message.reply("Не вдалося знайти відповідне повідомлення.")
+        return
+
+    # Regular user sending a support message — look up their profile for name/role
+    profile = _get_profile_by_tg(uid)
+    sender_name = profile["full_name"] if profile else (username or str(uid))
+    sender_role = profile["role"] if profile else "unknown"
+    row_id = _insert_support_message(uid, profile["id"] if profile else None, sender_role, sender_name, message.text or "")
+    try:
+        forwarded = await support_bot.send_message(
+            ADMIN_ID,
+            f"📩 Підтримка від {sender_name} (@{username or uid}):\n\n{message.text}",
+        )
+        if row_id:
+            _update_support_admin_msg_id(row_id, forwarded.message_id)
+    except Exception:
+        log.warning("Could not forward support message to admin")
+    await message.reply("Дякуємо! Ми отримали твоє повідомлення та відповімо найближчим часом.")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 @dp.error()
@@ -1325,6 +1444,24 @@ async def error_handler(event) -> bool:
             show_alert=True,
         )
     return True
+
+
+async def _run_support_bot() -> None:
+    if not support_bot:
+        return
+    try:
+        await support_bot.set_my_commands(
+            [BotCommand(command="start", description="Написати в підтримку")],
+            scope=BotCommandScopeDefault(),
+        )
+        await support_bot.delete_webhook(drop_pending_updates=True)
+        log.info("Starting SupportBot (polling)...")
+        await support_dp.start_polling(support_bot, allowed_updates=support_dp.resolve_used_update_types())
+    except TelegramConflictError:
+        log.error("SupportBot polling conflict.")
+        raise
+    finally:
+        await support_bot.session.close()
 
 
 async def main() -> None:
@@ -1364,7 +1501,11 @@ async def main() -> None:
 
         log.info("Starting TutorSpaceBot (polling)...")
         asyncio.create_task(reminder_loop())
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+        pollers = [dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())]
+        if support_bot:
+            pollers.append(_run_support_bot())
+        await asyncio.gather(*pollers)
     except TelegramConflictError:
         log.error("Polling conflict: stop other running bot instances or disable webhook.")
         raise
