@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from typing import TypeVar
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -318,6 +318,17 @@ def _get_profile_by_tg(telegram_user_id: int) -> dict | None:
     return res.data[0] if res.data else None
 
 
+def _get_profile_tz(profile_id: str) -> ZoneInfo:
+    res = db.table("profiles").select("timezone").eq("id", profile_id).execute()
+    tz_str = (res.data[0].get("timezone") or "") if res.data else ""
+    if tz_str:
+        try:
+            return ZoneInfo(tz_str)
+        except ZoneInfoNotFoundError:
+            pass
+    return KYIV_TZ
+
+
 def _insert_support_message(
     sender_tg_id: int,
     profile_id: str | None,
@@ -547,7 +558,10 @@ def _lookup_link_token(token: str) -> dict | None:
 
 
 def _link_telegram_user(profile_id: str, telegram_user_id: int) -> None:
-    db.table("profiles").update({"telegram_user_id": telegram_user_id}).eq("id", profile_id).execute()
+    db.table("profiles").update({
+        "telegram_user_id": telegram_user_id,
+        "telegram_notifications": True,
+    }).eq("id", profile_id).execute()
 
 
 def _delete_link_token(token: str) -> None:
@@ -647,8 +661,9 @@ async def send_reminders() -> None:
             if not student_tg:
                 continue
             teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            student_tz = await db_call(_get_profile_tz, ts_row["student_id"])
             starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-            time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+            time_str = starts.astimezone(student_tz).strftime("%H:%M")
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Перенести", callback_data=f"{RESCHEDULE_PREFIX}{lesson['id']}"),
                 InlineKeyboardButton(text="Все ок",    callback_data=f"{LESSON_OK_PREFIX}{lesson['id']}"),
@@ -672,8 +687,9 @@ async def send_reminders() -> None:
             if not student_tg:
                 continue
             teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            student_tz = await db_call(_get_profile_tz, ts_row["student_id"])
             starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-            time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+            time_str = starts.astimezone(student_tz).strftime("%H:%M")
             await bot.send_message(student_tg, f"За годину у тебе урок з {teacher_name}.")
             await db_call(_mark_sent, lesson["id"], "reminder_1h_sent")
         except Exception:
@@ -708,8 +724,9 @@ async def send_reminders() -> None:
             if not student_tg:
                 continue
             teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+            student_tz = await db_call(_get_profile_tz, ts_row["student_id"])
             starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-            time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m о %H:%M")
+            time_str = starts.astimezone(student_tz).strftime("%d.%m о %H:%M")
             await bot.send_message(
                 student_tg,
                 f"Не забудь зробити домашнє завдання до уроку з {teacher_name} {time_str}.",
@@ -849,9 +866,9 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
 # ── /menu + меню вчителя / учня ───────────────────────────────────────────────
 
-def _day_label(dt: datetime) -> str:
-    local = dt.astimezone(KYIV_TZ)
-    today = datetime.now(KYIV_TZ).date()
+def _day_label(dt: datetime, tz: ZoneInfo) -> str:
+    local = dt.astimezone(tz)
+    today = datetime.now(tz).date()
     if local.date() == today:
         return "Сьогодні"
     if local.date() == today + timedelta(days=1):
@@ -894,12 +911,13 @@ async def btn_teacher_schedule(message: Message) -> None:
         await message.answer("Найближчим часом уроків не заплановано.")
         return
 
+    tz = await db_call(_get_profile_tz, profile["id"])
     # Group by day
     groups: dict[str, list[str]] = {}
     for lesson in lessons:
         starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-        day = _day_label(starts)
-        time_str = starts.astimezone(KYIV_TZ).strftime("%H:%M")
+        day = _day_label(starts, tz)
+        time_str = starts.astimezone(tz).strftime("%H:%M")
         ts_row = await db_call(_get_ts_row, lesson["student_id"])
         student_name = ts_row["student_name"] if ts_row else "—"
         groups.setdefault(day, []).append(f"  {time_str} — {student_name}")
@@ -920,6 +938,7 @@ async def btn_teacher_hw(message: Message) -> None:
 
     submitted = await db_call(_teacher_hw_submitted, profile["id"])
     assigned_soon = await db_call(_teacher_hw_assigned_soon, profile["id"])
+    tz = await db_call(_get_profile_tz, profile["id"])
 
     lines: list[str] = []
 
@@ -931,7 +950,7 @@ async def btn_teacher_hw(message: Message) -> None:
             date_str = ""
             if hw.get("submitted_at"):
                 d = datetime.fromisoformat(hw["submitted_at"].replace("Z", "+00:00"))
-                date_str = f" (здано {d.astimezone(KYIV_TZ).strftime('%-d.%-m')})"
+                date_str = f" (здано {d.astimezone(tz).strftime('%-d.%-m')})"
             lines.append(f"  {name} — «{hw['title']}»{date_str}")
 
     if assigned_soon:
@@ -944,7 +963,7 @@ async def btn_teacher_hw(message: Message) -> None:
             date_str = ""
             if hw.get("deadline"):
                 d = datetime.fromisoformat(hw["deadline"].replace("Z", "+00:00"))
-                date_str = f" (до {d.astimezone(KYIV_TZ).strftime('%-d.%-m')})"
+                date_str = f" (до {d.astimezone(tz).strftime('%-d.%-m')})"
             lines.append(f"  {name} — «{hw['title']}»{date_str}")
 
     if not lines:
@@ -967,10 +986,11 @@ async def btn_student_lessons(message: Message) -> None:
         await message.answer("Найближчих уроків не заплановано.")
         return
 
+    tz = await db_call(_get_profile_tz, profile["id"])
     lines = []
     for lesson in lessons:
         starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-        dt_str = starts.astimezone(KYIV_TZ).strftime("%-d.%-m %H:%M")
+        dt_str = starts.astimezone(tz).strftime("%-d.%-m %H:%M")
         teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
         lines.append(f"{dt_str} — урок з {teacher_name}")
     await message.answer("\n".join(lines))
@@ -989,6 +1009,7 @@ async def btn_student_hw(message: Message) -> None:
         await message.answer("Домашніх завдань немає.")
         return
 
+    tz = await db_call(_get_profile_tz, profile["id"])
     STATUS_LABELS = {
         "assigned":           "🔴 Не здано",
         "submitted":          "🟡 На перевірці",
@@ -1001,7 +1022,7 @@ async def btn_student_hw(message: Message) -> None:
         date_str = ""
         if hw.get("deadline"):
             d = datetime.fromisoformat(hw["deadline"].replace("Z", "+00:00"))
-            date_str = f", до {d.astimezone(KYIV_TZ).strftime('%-d.%-m')}"
+            date_str = f", до {d.astimezone(tz).strftime('%-d.%-m')}"
         lines.append(f"{label} «{hw['title']}»{date_str}")
     await message.answer("\n".join(lines))
 
@@ -1115,8 +1136,10 @@ async def cb_reschedule_request(callback: CallbackQuery) -> None:
         await callback.answer("Урок не знайдено.", show_alert=True)
         return
 
+    student_profile = await db_call(_get_profile_by_tg, callback.from_user.id)
+    student_tz = await db_call(_get_profile_tz, student_profile["id"]) if student_profile else KYIV_TZ
     starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
-    time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
+    time_str = starts.astimezone(student_tz).strftime("%d.%m.%Y о %H:%M")
     _reschedule_pending[callback.from_user.id] = {
         "teacher_id": lesson["teacher_id"],
         "starts_at":  lesson["starts_at"],
@@ -1150,8 +1173,9 @@ async def handle_reschedule_reason(message: Message) -> None:
     reason_text = (message.text or "").strip()
     reason_display = "не вказана" if reason_text in ("Без причини", "") else reason_text
 
+    teacher_tz = await db_call(_get_profile_tz, state["teacher_id"])
     starts = datetime.fromisoformat(state["starts_at"].replace("Z", "+00:00"))
-    time_str = starts.astimezone(KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
+    time_str = starts.astimezone(teacher_tz).strftime("%d.%m.%Y о %H:%M")
     student_name = message.from_user.full_name or "Учень"
 
     teacher_tg = await db_call(_get_profile_tg, state["teacher_id"])
