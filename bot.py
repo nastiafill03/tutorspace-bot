@@ -1525,7 +1525,7 @@ async def support_handle_message(message: Message) -> None:
             ]])
         forwarded = await support_bot.send_message(
             ADMIN_ID,
-            f"📩 Підтримка від {sender_name} (@{username or uid}):\n\n{message.text}",
+            f"📩 Підтримка від {sender_name}{f' (@{username})' if username else f' (ID: {uid})'}:\n\n{message.text}",
             reply_markup=kb,
         )
         if row_id:
