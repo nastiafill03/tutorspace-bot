@@ -10,7 +10,6 @@ from typing import TypeVar
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import CommandStart, Command, CommandObject, BaseFilter
@@ -55,8 +54,6 @@ STATUS_CALLBACK        = "show_status"
 CONFIRM_LAUNCH_CALLBACK = "confirm_launch"
 CANCEL_LAUNCH_CALLBACK  = "cancel_launch"
 # Lesson action callbacks carry the request id: "lesson_confirm:<id>" / "lesson_reject:<id>"
-LESSON_CONFIRM_PREFIX = "lesson_confirm:"
-LESSON_REJECT_PREFIX  = "lesson_reject:"
 RESCHEDULE_PREFIX     = "reschedule_req:"
 LESSON_OK_PREFIX      = "lesson_ok:"
 
@@ -86,8 +83,6 @@ except ValueError as exc:
     raise RuntimeError("ADMIN_ID must be a numeric Telegram user id") from exc
 PLATFORM_URL    = required_env("PLATFORM_URL")
 INSTAGRAM_URL        = os.environ.get("INSTAGRAM_URL", "").strip()
-WEBHOOK_SECRET       = os.environ.get("WEBHOOK_SECRET", "").strip()
-NOTIFY_PORT          = int(os.environ.get("NOTIFY_PORT", "8080"))
 SUPPORT_BOT_TOKEN    = os.environ.get("SUPPORT_BOT_TOKEN", "").strip()
 SUPPORT_BOT_USERNAME = os.environ.get("SUPPORT_BOT_USERNAME", "").strip()
 
@@ -566,14 +561,6 @@ def _link_telegram_user(profile_id: str, telegram_user_id: int) -> None:
 
 def _delete_link_token(token: str) -> None:
     db.table("telegram_link_tokens").delete().eq("token", token).execute()
-
-
-def _rpc_confirm_lesson(reschedule_id: str):
-    return db.rpc("confirm_lesson_reschedule", {"p_reschedule_id": reschedule_id}).execute()
-
-
-def _rpc_reject_lesson(reschedule_id: str):
-    return db.rpc("reject_lesson_reschedule", {"p_reschedule_id": reschedule_id}).execute()
 
 
 def _get_lesson(lesson_id: str) -> dict | None:
@@ -1279,32 +1266,6 @@ async def run_broadcast(admin_chat_id: int) -> None:
         log.exception("Could not send broadcast summary to admin")
 
 
-# ── Lesson reschedule actions (from /notify webhook) ─────────────────────────
-
-@dp.callback_query(F.data.startswith(LESSON_CONFIRM_PREFIX))
-async def cb_lesson_confirm(callback: CallbackQuery) -> None:
-    reschedule_id = callback.data[len(LESSON_CONFIRM_PREFIX):]
-    try:
-        await db_call(_rpc_confirm_lesson, reschedule_id)
-        if callback.message:
-            await callback.message.edit_text("✅ Перенесення підтверджено.")
-        await callback.answer("Підтверджено!")
-    except Exception:
-        log.exception("confirm_lesson_reschedule failed for id=%s", reschedule_id)
-        await callback.answer("Помилка. Спробуй ще раз.", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith(LESSON_REJECT_PREFIX))
-async def cb_lesson_reject(callback: CallbackQuery) -> None:
-    reschedule_id = callback.data[len(LESSON_REJECT_PREFIX):]
-    try:
-        await db_call(_rpc_reject_lesson, reschedule_id)
-        if callback.message:
-            await callback.message.edit_text("❌ Перенесення відхилено.")
-        await callback.answer("Відхилено!")
-    except Exception:
-        log.exception("reject_lesson_reschedule failed for id=%s", reschedule_id)
-        await callback.answer("Помилка. Спробуй ще раз.", show_alert=True)
 
 
 # ── Адмін: /admin, /stats, /top, /recent + reply-кнопки ──────────────────────
@@ -1406,88 +1367,6 @@ async def btn_recent(message: Message) -> None:
     await cmd_recent(message)
 
 
-# ── HTTP /notify endpoint (Supabase Database Webhooks) ───────────────────────
-
-async def _dispatch_notification(chat_id: int, event_type: str, data: dict) -> None:
-    if event_type == "lesson_reschedule_request":
-        student_name  = data.get("student_name", "Учень")
-        proposed_time = data.get("proposed_time", "")
-        reschedule_id = data.get("reschedule_id", "")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="✅ Підтвердити",
-                callback_data=f"{LESSON_CONFIRM_PREFIX}{reschedule_id}",
-            ),
-            InlineKeyboardButton(
-                text="❌ Відхилити",
-                callback_data=f"{LESSON_REJECT_PREFIX}{reschedule_id}",
-            ),
-        ]])
-        await bot.send_message(
-            chat_id,
-            f"📅 {student_name} просить перенести урок.\n"
-            f"Пропонований час: {proposed_time}",
-            reply_markup=kb,
-        )
-
-    elif event_type == "lesson_cancelled":
-        student_name = data.get("student_name", "Учень")
-        date = data.get("date", "")
-        await bot.send_message(chat_id, f"❌ {student_name} скасував(-ла) урок {date}.")
-
-    elif event_type == "homework_assigned":
-        title = data.get("title", "Нове завдання")
-        await bot.send_message(chat_id, f"📝 Нове домашнє завдання: {title}")
-
-    elif event_type == "grade_received":
-        subject = data.get("subject", "")
-        grade   = data.get("grade", "")
-        await bot.send_message(chat_id, f"🎓 Нова оцінка з {subject}: {grade}")
-
-    elif event_type == "payment_received":
-        amount   = data.get("amount", "")
-        currency = data.get("currency", "UAH")
-        await bot.send_message(chat_id, f"💰 Отримано платіж: {amount} {currency}")
-
-    else:
-        log.warning("Unknown event_type in /notify: %s", event_type)
-
-
-async def notify_handler(request: web.Request) -> web.Response:
-    if WEBHOOK_SECRET:
-        secret = request.headers.get("X-Webhook-Secret", "")
-        if secret != WEBHOOK_SECRET:
-            return web.Response(status=401, text="Unauthorized")
-
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="Invalid JSON")
-
-    event_type = data.get("event_type", "")
-    profile_id = data.get("profile_id", "")
-    event_data = data.get("data", {})
-
-    if not profile_id:
-        return web.Response(status=400, text="Missing profile_id")
-
-    chat_id = await db_call(_get_profile_chat_id, profile_id)
-    if not chat_id:
-        return web.Response(status=404, text="No telegram_chat_id for this profile")
-
-    try:
-        await _dispatch_notification(chat_id, event_type, event_data)
-    except Exception:
-        log.exception("Failed to dispatch notification for profile_id=%s", profile_id)
-        return web.Response(status=500, text="Dispatch error")
-
-    return web.Response(text="OK")
-
-
-def create_notify_app() -> web.Application:
-    app = web.Application()
-    app.router.add_post("/notify", notify_handler)
-    return app
 
 
 # ── Support bot handlers ───────────────────────────────────────────────────────
@@ -1622,9 +1501,6 @@ async def _run_support_bot() -> None:
 
 
 async def main() -> None:
-    if not WEBHOOK_SECRET:
-        log.warning("WEBHOOK_SECRET is not set — /notify endpoint accepts requests without auth")
-
     try:
         await bot.set_my_commands(
             [
@@ -1648,13 +1524,6 @@ async def main() -> None:
             scope=BotCommandScopeChat(chat_id=ADMIN_ID),
         )
         await bot.delete_webhook(drop_pending_updates=True)
-
-        notify_app = create_notify_app()
-        runner = web.AppRunner(notify_app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", NOTIFY_PORT)
-        await site.start()
-        log.info("Notify webhook server listening on port %s", NOTIFY_PORT)
 
         log.info("Starting TutorSpaceBot (polling)...")
         asyncio.create_task(reminder_loop())
