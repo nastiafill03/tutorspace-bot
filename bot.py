@@ -42,8 +42,9 @@ BTN_LAUNCH   = "🚀 Запустити платформу"
 
 BTN_TEACHER_SCHEDULE = "📅 Розклад"
 BTN_TEACHER_HW       = "📝 Домашні завдання"
-BTN_STUDENT_LESSONS  = "📅 Мої уроки"
-BTN_STUDENT_HW       = "📝 Моє ДЗ"
+BTN_STUDENT_LESSONS     = "📅 Мої уроки"
+BTN_STUDENT_HW          = "📝 Моє ДЗ"
+BTN_STUDENT_RESCHEDULE  = "🔄 Перенести урок"
 BTN_PLATFORM         = "🌐 Відкрити платформу"
 BTN_SUPPORT          = "🆘 Підтримка"
 
@@ -162,6 +163,7 @@ def student_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_STUDENT_LESSONS), KeyboardButton(text=BTN_STUDENT_HW)],
             [KeyboardButton(text=BTN_PLATFORM),        KeyboardButton(text=BTN_SUPPORT)],
+            [KeyboardButton(text=BTN_STUDENT_RESCHEDULE)],
         ],
         resize_keyboard=True,
         persistent=True,
@@ -523,6 +525,24 @@ def _student_lessons_upcoming(ts_ids: list[str]) -> list[dict]:
         .gte("starts_at", now.isoformat())
         .order("starts_at")
         .limit(5)
+        .execute()
+    )
+    return res.data or []
+
+
+def _student_lessons_reschedulable(ts_ids: list[str]) -> list[dict]:
+    if not ts_ids:
+        return []
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=14)
+    res = (
+        db.table("lessons")
+        .select("id, teacher_id, starts_at")
+        .in_("student_id", ts_ids)
+        .eq("status", "planned")
+        .gte("starts_at", now.isoformat())
+        .lte("starts_at", end.isoformat())
+        .order("starts_at")
         .execute()
     )
     return res.data or []
@@ -1014,6 +1034,36 @@ async def btn_student_hw(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
+@dp.message(F.text == BTN_STUDENT_RESCHEDULE)
+async def btn_student_reschedule(message: Message) -> None:
+    profile = await _require_profile(message)
+    if not profile or profile["role"] != "student":
+        await message.answer("Ця кнопка доступна тільки для учнів.")
+        return
+
+    ts_ids = await db_call(_student_ts_ids, profile["id"])
+    lessons = await db_call(_student_lessons_reschedulable, ts_ids)
+    if not lessons:
+        await message.answer("Немає уроків найближчих 2 тижнів, які можна перенести.")
+        return
+
+    tz = await db_call(_get_profile_tz, profile["id"])
+    buttons = []
+    for lesson in lessons:
+        starts = datetime.fromisoformat(lesson["starts_at"].replace("Z", "+00:00"))
+        dt_str = starts.astimezone(tz).strftime("%-d.%-m о %H:%M")
+        teacher_name = await db_call(_get_profile_name, lesson["teacher_id"]) or "Вчитель"
+        buttons.append([InlineKeyboardButton(
+            text=f"{dt_str} — {teacher_name}",
+            callback_data=f"{RESCHEDULE_PREFIX}{lesson['id']}",
+        )])
+
+    await message.answer(
+        "Який урок перенести?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
 @dp.message(F.text == BTN_PLATFORM)
 async def btn_platform(message: Message) -> None:
     profile = await _require_profile(message)
@@ -1164,14 +1214,37 @@ async def handle_reschedule_reason(message: Message) -> None:
     starts = datetime.fromisoformat(state["starts_at"].replace("Z", "+00:00"))
     time_str = starts.astimezone(teacher_tz).strftime("%d.%m.%Y о %H:%M")
     student_name = message.from_user.full_name or "Учень"
+    username = message.from_user.username if message.from_user else None
+
+    # Look up the teacher_students row to get the teacher's contact info for this student
+    student_profile = await db_call(_get_profile_by_tg, message.from_user.id)
+    contact: str | None = None
+    if student_profile:
+        ts_res = await db_call(
+            lambda: db.table("teacher_students")
+            .select("contact")
+            .eq("student_id", student_profile["id"])
+            .eq("teacher_id", state["teacher_id"])
+            .maybeSingle()
+            .execute()
+        )
+        contact = (ts_res.data or {}).get("contact") or None
+
+    notify_text = f"{student_name} хоче перенести урок {time_str}. Причина: {reason_display}."
+    notify_kb = None
+    if username:
+        notify_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔗 Написати учню", url=f"https://t.me/{username}")
+        ]])
+    elif contact:
+        notify_text += f"\n\nКонтакт учня: {contact}"
+    else:
+        notify_text += "\n\nКонтакт учня: не вказано"
 
     teacher_tg = await db_call(_get_profile_tg, state["teacher_id"])
     if teacher_tg:
         try:
-            await bot.send_message(
-                teacher_tg,
-                f"{student_name} хоче перенести урок {time_str}. Причина: {reason_display}.",
-            )
+            await bot.send_message(teacher_tg, notify_text, reply_markup=notify_kb)
         except Exception:
             log.exception("Failed to notify teacher about reschedule, teacher_id=%s", state["teacher_id"])
 
