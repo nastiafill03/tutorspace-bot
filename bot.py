@@ -1225,7 +1225,7 @@ async def handle_reschedule_reason(message: Message) -> None:
             .select("contact")
             .eq("student_id", student_profile["id"])
             .eq("teacher_id", state["teacher_id"])
-            .maybeSingle()
+            .maybe_single()
             .execute()
         )
         contact = (ts_res.data or {}).get("contact") or None
