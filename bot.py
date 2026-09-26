@@ -57,8 +57,11 @@ CANCEL_LAUNCH_CALLBACK  = "cancel_launch"
 # Lesson action callbacks carry the request id: "lesson_confirm:<id>" / "lesson_reject:<id>"
 RESCHEDULE_PREFIX     = "reschedule_req:"
 LESSON_OK_PREFIX      = "lesson_ok:"
+PLAN_CHOICE_PREFIX    = "plan_choice:"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+PRESET_BRAND_COLORS = {"mint", "lavender", "sky", "peach"}
 
 # In-memory state: {telegram_user_id: {teacher_id, starts_at}}
 _reschedule_pending: dict[int, dict] = {}
@@ -742,6 +745,49 @@ async def send_reminders() -> None:
         except Exception:
             log.exception("homework reminder failed for hw_id=%s", hw.get("id"))
 
+    # Pro trial expiry notifications
+    now_iso = datetime.now(timezone.utc).isoformat()
+    expired_res = await db_call(
+        lambda: db.table("profiles")
+        .select("id, telegram_user_id, brand_color, full_name")
+        .eq("subscription_plan", "pro")
+        .lte("pro_expires_at", now_iso)
+        .is_("pro_expiry_notified_at", "null")
+        .not_.is_("telegram_user_id", "null")
+        .execute()
+    )
+    for profile in (expired_res.data or []):
+        try:
+            tg_id = profile.get("telegram_user_id")
+            if not tg_id:
+                continue
+            profile_id = profile["id"]
+            brand_color = profile.get("brand_color") or "mint"
+
+            updates: dict = {"pro_expiry_notified_at": now_iso}
+            if brand_color not in PRESET_BRAND_COLORS:
+                updates["brand_color"] = "mint"
+
+            await db_call(
+                lambda pid=profile_id, u=updates: db.table("profiles")
+                .update(u)
+                .eq("id", pid)
+                .execute()
+            )
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎁 Обрати Pro",           callback_data=f"{PLAN_CHOICE_PREFIX}pro"),
+                InlineKeyboardButton(text="🆓 Обрати безкоштовний", callback_data=f"{PLAN_CHOICE_PREFIX}free"),
+            ]])
+            await bot.send_message(
+                tg_id,
+                "Твій безкоштовний пробний Pro-період завершився. "
+                "Обери план, щоб продовжити користуватись платформою:",
+                reply_markup=kb,
+            )
+        except Exception:
+            log.exception("pro expiry notification failed for profile_id=%s", profile.get("id"))
+
 
 async def reminder_loop() -> None:
     while True:
@@ -1197,6 +1243,40 @@ async def cb_reschedule_request(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith(LESSON_OK_PREFIX))
 async def cb_lesson_ok(callback: CallbackQuery) -> None:
     await callback.answer("Чудово! Побачимось на уроці 👍")
+
+
+@dp.callback_query(F.data == f"{PLAN_CHOICE_PREFIX}pro")
+async def cb_plan_choice_pro(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer("Дякуємо! Скоро зв'яжемось щодо оплати.")
+
+
+@dp.callback_query(F.data == f"{PLAN_CHOICE_PREFIX}free")
+async def cb_plan_choice_free(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not callback.from_user:
+        return
+    profile = await db_call(_get_profile_by_tg, callback.from_user.id)
+    if not profile:
+        await callback.message.answer("Профіль не знайдено.")
+        return
+    teacher_id = profile["id"]
+    res = await db_call(
+        lambda: db.table("teacher_students")
+        .select("id", count="exact")
+        .eq("teacher_id", teacher_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    count = res.count or 0
+    if count <= 5:
+        await callback.message.answer("Ок, ти вже на безкоштовному плані.")
+    else:
+        await callback.message.answer(
+            f"У тебе {count} активних учнів, а безкоштовний план дозволяє 5. "
+            f"Зайди на платформу, щоб обрати, кого залишити: "
+            f"https://tutorspacecrm.com/teacher/choose-students"
+        )
 
 
 class _AwaitingRescheduleReason(BaseFilter):
